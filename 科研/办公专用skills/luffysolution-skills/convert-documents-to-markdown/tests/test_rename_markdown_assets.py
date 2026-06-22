@@ -2,6 +2,7 @@ import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "rename-markdown-assets.py"
@@ -120,6 +121,69 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             [("markdown-inline", "images/local.png")],
         )
 
+    def test_scan_markdown_does_not_treat_data_src_as_src(self):
+        markdown = (
+            '<img data-src="images/lazy.png" alt="lazy">\n'
+            '<img custom.src="images/custom.png" alt="custom">\n'
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "lazy.png").write_bytes(b"asset")
+            (images / "custom.png").write_bytes(b"asset")
+
+            references = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )
+
+        self.assertEqual(references, [])
+
+    def test_scan_markdown_parses_img_after_quoted_greater_than(self):
+        markdown = '<img alt="value > threshold" src="images/chart.png">\n'
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "chart.png").write_bytes(b"asset")
+
+            references = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )
+            encoded_markdown = markdown_path.read_bytes()
+
+        self.assertEqual(len(references), 1)
+        reference = references[0]
+        self.assertEqual(reference.raw_destination, "images/chart.png")
+        self.assertEqual(
+            encoded_markdown[reference.start : reference.end],
+            b"images/chart.png",
+        )
+
+    def test_scan_markdown_normalizes_html_entity_query_and_fragment(self):
+        raw_destination = "images/a&amp;b.png?width=200#preview"
+        markdown = f'<img src="{raw_destination}">\n'
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "a&b.png").write_bytes(b"asset")
+
+            references = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )
+            encoded_markdown = markdown_path.read_bytes()
+
+        self.assertEqual(len(references), 1)
+        reference = references[0]
+        self.assertEqual(reference.raw_destination, raw_destination)
+        self.assertEqual(reference.decoded_destination, "images/a&b.png")
+        self.assertEqual(reference.asset_path, images / "a&b.png")
+        self.assertEqual(
+            encoded_markdown[reference.start : reference.end].decode(),
+            raw_destination,
+        )
+
     def test_scan_markdown_records_utf8_byte_offsets_for_cjk_and_crlf(self):
         markdown = (
             "标题\r\n"
@@ -172,6 +236,134 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
         self.assertEqual(
             [reference.decoded_destination for reference in references],
             ["images/used.png"],
+        )
+
+    def test_scan_markdown_shortcut_uses_first_normalized_definition(self):
+        markdown = (
+            "![Plot   Name]\n"
+            "[ plot name ]: images/first.png\n"
+            "[PLOT NAME]: images/second.png\n"
+            "![Collapsed   Label][]\n"
+            "[collapsed label]: images/collapsed.png\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "first.png").write_bytes(b"asset")
+            (images / "second.png").write_bytes(b"asset")
+            (images / "collapsed.png").write_bytes(b"asset")
+
+            references = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )
+
+        self.assertEqual(
+            [reference.decoded_destination for reference in references],
+            ["images/first.png", "images/collapsed.png"],
+        )
+
+    def test_scan_markdown_ignores_escaped_image_markers(self):
+        markdown = (
+            "\\![inline](images/escaped-inline.png)\n"
+            "\\![reference][plot]\n"
+            "[plot]: images/escaped-reference.png\n"
+            "![local](images/local.png)\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            for name in (
+                "escaped-inline.png",
+                "escaped-reference.png",
+                "local.png",
+            ):
+                (images / name).write_bytes(b"asset")
+
+            references = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )
+
+        self.assertEqual(
+            [reference.decoded_destination for reference in references],
+            ["images/local.png"],
+        )
+
+    def test_scan_markdown_unescapes_local_destination_spaces(self):
+        markdown = "![space](images/a\\ b.png)\n"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "a b.png").write_bytes(b"asset")
+
+            references = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )
+
+        self.assertEqual(len(references), 1)
+        self.assertEqual(references[0].raw_destination, "images/a\\ b.png")
+        self.assertEqual(
+            references[0].decoded_destination, "images/a b.png"
+        )
+        self.assertEqual(references[0].asset_path, images / "a b.png")
+
+    def test_scan_markdown_preserves_escaped_fragment_character(self):
+        markdown = "![hash](images/a\\#b.png)\n"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "a#b.png").write_bytes(b"asset")
+
+            references = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )
+
+        self.assertEqual(len(references), 1)
+        self.assertEqual(
+            references[0].decoded_destination, "images/a#b.png"
+        )
+        self.assertEqual(references[0].asset_path, images / "a#b.png")
+
+    def test_escaped_backticks_do_not_protect_image_syntax(self):
+        markdown = "\\` ![local](images/local.png) \\`\n"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "local.png").write_bytes(b"asset")
+
+            references = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )
+
+        self.assertEqual(
+            [reference.decoded_destination for reference in references],
+            ["images/local.png"],
+        )
+
+    def test_scan_markdown_handles_nested_and_escaped_alt_brackets(self):
+        markdown = (
+            "![outer [inner\\] value]](images/nested.png)\n"
+            "![plot \\[draft\\]][plot]\n"
+            "[plot]: images/reference.png\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "nested.png").write_bytes(b"asset")
+            (images / "reference.png").write_bytes(b"asset")
+
+            references = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )
+
+        self.assertEqual(
+            [reference.decoded_destination for reference in references],
+            ["images/nested.png", "images/reference.png"],
         )
 
     def test_scan_markdown_rejects_path_traversal(self):
@@ -228,6 +420,31 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             [reference.decoded_destination for reference in references],
             ["images/safe.png"],
         )
+
+    def test_destination_to_asset_rejects_mocked_canonical_escape(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            markdown_path = root / "docs" / "report.md"
+            candidate = root / "docs" / "images" / "link" / "secret.png"
+            outside = root.parent / "outside" / "secret.png"
+            real_resolve = Path.resolve
+
+            def resolve_with_escape(path, strict=False):
+                if path == candidate:
+                    return outside
+                return real_resolve(path, strict=strict)
+
+            with patch.object(
+                Path,
+                "resolve",
+                autospec=True,
+                side_effect=resolve_with_escape,
+            ):
+                result = rename_markdown_assets.destination_to_asset(
+                    markdown_path, root, "images/link/secret.png"
+                )
+
+        self.assertIsNone(result)
 
     def test_scan_markdown_does_not_require_asset_to_exist(self):
         markdown = "![future](images/not-created-yet.png)\n"

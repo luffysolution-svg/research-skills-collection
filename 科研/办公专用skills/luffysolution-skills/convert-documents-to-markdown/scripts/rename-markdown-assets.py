@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import html
 import re
 import sys
 import unicodedata
@@ -84,6 +85,15 @@ def _merge_ranges(
     return merged
 
 
+def _is_escaped(text: str, position: int) -> bool:
+    backslashes = 0
+    position -= 1
+    while position >= 0 and text[position] == "\\":
+        backslashes += 1
+        position -= 1
+    return backslashes % 2 == 1
+
+
 def protected_ranges(text: str) -> list[tuple[int, int]]:
     ranges = [
         (match.start(), match.end())
@@ -113,13 +123,17 @@ def protected_ranges(text: str) -> list[tuple[int, int]]:
             break
         start = position + opener.start()
         run = opener.group()
-        if _overlaps(ranges, start, start + len(run)):
+        if (
+            _is_escaped(text, start)
+            or _overlaps(ranges, start, start + len(run))
+        ):
             position = start + len(run)
             continue
         search_from = start + len(run)
         end = text.find(run, search_from)
         while end != -1 and (
-            (end > 0 and text[end - 1] == "`")
+            _is_escaped(text, end)
+            or (end > 0 and text[end - 1] == "`")
             or (
                 end + len(run) < len(text)
                 and text[end + len(run)] == "`"
@@ -136,16 +150,32 @@ def protected_ranges(text: str) -> list[tuple[int, int]]:
     return ranges
 
 
+def _without_url_suffix(destination: str) -> str:
+    for position, character in enumerate(destination):
+        if character in "?#" and not _is_escaped(destination, position):
+            return destination[:position]
+    return destination
+
+
 def destination_to_asset(
     markdown_path: Path, root: Path, raw_destination: str
 ) -> tuple[str, Path] | None:
-    decoded_destination = unquote(raw_destination)
-    destination_path = Path(decoded_destination)
+    entity_destination = html.unescape(raw_destination)
+    scheme_destination = unquote(entity_destination)
+    scheme_path = Path(scheme_destination)
     if (
-        not destination_path.is_absolute()
-        and re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", decoded_destination)
+        not scheme_path.is_absolute()
+        and re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", scheme_destination)
     ):
         return None
+
+    decoded_destination = unquote(_without_url_suffix(entity_destination))
+    decoded_destination = re.sub(
+        r"""\\([!"#$%&'()*+,\-./:;<=>?@\[\]^_`{|}~\\ \t])""",
+        r"\1",
+        decoded_destination,
+    )
+    destination_path = Path(decoded_destination)
 
     canonical_root = root.resolve(strict=False)
     if destination_path.is_absolute():
@@ -201,7 +231,32 @@ def _destination_span(
     return start, position
 
 
+def _closing_bracket(text: str, opening_bracket: int) -> int | None:
+    depth = 1
+    position = opening_bracket + 1
+    while position < len(text):
+        character = text[position]
+        if character in "\r\n":
+            return None
+        if character == "\\":
+            position += 2
+            continue
+        if character == "[":
+            depth += 1
+        elif character == "]":
+            depth -= 1
+            if depth == 0:
+                return position
+        position += 1
+    return None
+
+
 def _reference_label(value: str) -> str:
+    value = re.sub(
+        r"""\\([!"#$%&'()*+,\-./:;<=>?@\[\]^_`{|}~\\])""",
+        r"\1",
+        value,
+    )
     return re.sub(r"\s+", " ", value.strip()).casefold()
 
 
@@ -245,42 +300,67 @@ def scan_markdown(path: Path, root: Path) -> list[Reference]:
             )
         )
 
-    inline_pattern = re.compile(r"!\[[^\]\r\n]*\]\(")
-    for match in inline_pattern.finditer(text):
-        if _overlaps(protected, match.start(), match.end()):
-            continue
-        span = _destination_span(text, match.end() - 1)
-        if span is None or _overlaps(protected, *span):
-            continue
-        start, end = span
-        add_reference("markdown-inline", start, end, text[start:end])
-
     used_labels: set[str] = set()
-    reference_image_pattern = re.compile(
-        r"!\[(?P<alt>[^\]\r\n]*)\]\[(?P<label>[^\]\r\n]*)\]"
-    )
-    for match in reference_image_pattern.finditer(text):
-        if _overlaps(protected, match.start(), match.end()):
+    position = 0
+    while position < len(text):
+        marker = text.find("![", position)
+        if marker == -1:
+            break
+        if (
+            _is_escaped(text, marker)
+            or _overlaps(protected, marker, marker + 2)
+        ):
+            position = marker + 2
             continue
-        label = match.group("label") or match.group("alt")
-        used_labels.add(_reference_label(label))
+        alt_end = _closing_bracket(text, marker + 1)
+        if alt_end is None:
+            position = marker + 2
+            continue
+        alt = text[marker + 2 : alt_end]
+        following = alt_end + 1
+        if following < len(text) and text[following] == "(":
+            span = _destination_span(text, following)
+            if span is not None and not _overlaps(protected, *span):
+                start, end = span
+                add_reference(
+                    "markdown-inline", start, end, text[start:end]
+                )
+            position = following + 1
+            continue
+        if following < len(text) and text[following] == "[":
+            label_end = _closing_bracket(text, following)
+            if label_end is not None:
+                label = text[following + 1 : label_end] or alt
+                used_labels.add(_reference_label(label))
+                position = label_end + 1
+                continue
+        used_labels.add(_reference_label(alt))
+        position = following
 
     definition_pattern = re.compile(
         r"(?m)^[ \t]{0,3}\[(?P<label>[^\]\r\n]+)\]:[ \t]*"
         r"(?:<(?P<angle>[^>\r\n]*)>|(?P<plain>\S+))"
     )
+    defined_labels: set[str] = set()
     for match in definition_pattern.finditer(text):
         if _overlaps(protected, match.start(), match.end()):
             continue
-        if _reference_label(match.group("label")) not in used_labels:
+        label = _reference_label(match.group("label"))
+        if label in defined_labels:
+            continue
+        defined_labels.add(label)
+        if label not in used_labels:
             continue
         group = "angle" if match.group("angle") is not None else "plain"
         start, end = match.span(group)
         add_reference("markdown-reference", start, end, text[start:end])
 
-    image_tag_pattern = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+    image_tag_pattern = re.compile(
+        r"""<img\b(?:[^"'<>]|"[^"]*"|'[^']*')*>""",
+        re.IGNORECASE,
+    )
     source_pattern = re.compile(
-        r"""\bsrc\s*=\s*(?:
+        r"""(?<!\S)src\s*=\s*(?:
             "(?P<double>[^"]*)"
             |'(?P<single>[^']*)'
             |(?P<bare>[^\s>]+)
