@@ -1,0 +1,4 @@
+interface:
+  display_name: "文档转 Markdown"
+  short_description: "使用 MarkItDown、OCR 或 MinerU 转换文档"
+  default_prompt: "Use $convert-documents-to-markdown to convert this document into verified Markdown with the appropriate engine."
