@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +20,13 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
         markdown_path = root / "docs" / "report.md"
         markdown_path.write_text(markdown, encoding="utf-8", newline="")
         return root, images, markdown_path
+
+    def write_json(self, path, value):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(value, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     def test_sha256_file_returns_full_lowercase_digest(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -710,6 +718,186 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             [reference.decoded_destination for reference in references],
             ["images/visible.png"],
         )
+
+    def test_graph_tracks_shared_missing_and_unreferenced_assets(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images = root / "images"
+            docs = root / "docs"
+            images.mkdir()
+            docs.mkdir()
+            shared = images / "shared.jpg"
+            shared.write_bytes(b"shared")
+            unreferenced = images / "unused.png"
+            unreferenced.write_bytes(b"unused")
+            first = docs / "a.md"
+            second = docs / "b.md"
+            first.write_text(
+                "![shared](../images/shared.jpg)\n"
+                "![missing](../images/missing.png)\n",
+                encoding="utf-8",
+            )
+            second.write_text(
+                "![shared again](../images/shared.jpg)\n",
+                encoding="utf-8",
+            )
+
+            documents, assets, warnings = (
+                rename_markdown_assets.build_asset_graph(root)
+            )
+
+        shared_path = shared.resolve()
+        self.assertEqual(documents, [first, second])
+        self.assertEqual(list(assets), [shared_path])
+        self.assertEqual(len(assets[shared_path].references), 2)
+        self.assertEqual(
+            [warning["code"] for warning in warnings],
+            ["missing-asset", "unreferenced-asset"],
+        )
+        self.assertEqual(
+            [warning["path"] for warning in warnings],
+            [
+                str((images / "missing.png").resolve()),
+                str(unreferenced.resolve()),
+            ],
+        )
+
+    def test_content_list_normalizes_image_evidence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image = root / "images" / "shared.jpg"
+            image.parent.mkdir()
+            image.write_bytes(b"shared")
+            metadata_path = root / "content_list.json"
+            self.write_json(
+                metadata_path,
+                [
+                    {
+                        "type": "image",
+                        "img_path": "images/shared.jpg",
+                        "image_caption": [
+                            "Figure 1. Temperature profile"
+                        ],
+                        "page_idx": 2,
+                        "bbox": [10, 20, 30, 40],
+                    }
+                ],
+            )
+
+            metadata = rename_markdown_assets.load_mineru_metadata(root)
+
+        evidence = metadata[image.resolve()][0]
+        self.assertEqual(
+            evidence,
+            {
+                "path": str(image.resolve()),
+                "caption": "Figure 1. Temperature profile",
+                "visual_type": "image",
+                "page_idx": 2,
+                "bbox": [10, 20, 30, 40],
+                "source": "content_list",
+            },
+        )
+
+    def test_content_list_v2_normalizes_nested_content_evidence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image = root / "images" / "shared.webp"
+            image.parent.mkdir()
+            image.write_bytes(b"shared")
+            metadata_path = root / "content_list_v2.json"
+            self.write_json(
+                metadata_path,
+                {
+                    "content": [
+                        {
+                            "content": {
+                                "image_path": "images/shared.webp",
+                                "caption": "Figure 1. Temperature profile",
+                                "sub_type": "image",
+                                "page_idx": 2,
+                                "bbox": [1, 2, 3, 4],
+                            }
+                        }
+                    ]
+                },
+            )
+
+            metadata = rename_markdown_assets.load_mineru_metadata(root)
+
+        evidence = metadata[image.resolve()][0]
+        self.assertEqual(
+            set(evidence),
+            {
+                "path",
+                "caption",
+                "visual_type",
+                "page_idx",
+                "bbox",
+                "source",
+            },
+        )
+        self.assertEqual(evidence["caption"], "Figure 1. Temperature profile")
+        self.assertEqual(evidence["visual_type"], "image")
+        self.assertEqual(evidence["page_idx"], 2)
+        self.assertEqual(evidence["bbox"], [1, 2, 3, 4])
+        self.assertEqual(evidence["source"], "content_list_v2")
+
+    def test_supported_image_extensions_are_case_insensitive(self):
+        expected = {
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".webp",
+            ".gif",
+            ".bmp",
+            ".tif",
+            ".tiff",
+            ".svg",
+        }
+
+        self.assertEqual(
+            rename_markdown_assets.SUPPORTED_IMAGE_EXTENSIONS,
+            expected,
+        )
+        self.assertTrue(
+            all(
+                suffix.upper().lower()
+                in rename_markdown_assets.SUPPORTED_IMAGE_EXTENSIONS
+                for suffix in expected
+            )
+        )
+
+    def test_unreferenced_warnings_ignore_unrelated_image_directories(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images = root / "docs" / "images"
+            unrelated = root / "website" / "assets"
+            images.mkdir(parents=True)
+            unrelated.mkdir(parents=True)
+            referenced = images / "used.PNG"
+            referenced.write_bytes(b"used")
+            local_unused = images / "unused.TIFF"
+            local_unused.write_bytes(b"unused")
+            unrelated_image = unrelated / "logo.png"
+            unrelated_image.write_bytes(b"logo")
+            markdown = root / "docs" / "report.md"
+            markdown.write_text(
+                "![used](images/used.PNG)\n",
+                encoding="utf-8",
+            )
+
+            _documents, _assets, warnings = (
+                rename_markdown_assets.build_asset_graph(root)
+            )
+
+        unreferenced_paths = {
+            warning["path"]
+            for warning in warnings
+            if warning["code"] == "unreferenced-asset"
+        }
+        self.assertEqual(unreferenced_paths, {str(local_unused.resolve())})
+        self.assertNotIn(str(unrelated_image.resolve()), unreferenced_paths)
 
 
 if __name__ == "__main__":

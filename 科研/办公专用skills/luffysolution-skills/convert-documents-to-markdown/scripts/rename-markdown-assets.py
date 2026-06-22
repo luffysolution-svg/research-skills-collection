@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import html
+import json
 import re
 import sys
 import unicodedata
@@ -29,6 +30,19 @@ class AssetRecord:
     evidence: list[dict[str, object]]
     proposed_name: str = ""
     reason: str = ""
+
+
+SUPPORTED_IMAGE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".gif",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".svg",
+}
 
 
 WINDOWS_RESERVED = {
@@ -495,6 +509,261 @@ def scan_markdown(path: Path, root: Path) -> list[Reference]:
         add_reference("html-img", start, end, text[start:end])
 
     return [reference for _, reference in sorted(found, key=lambda item: item[0])]
+
+
+def iter_markdown_files(root: Path) -> list[Path]:
+    canonical_root = root.resolve(strict=False)
+    return sorted(
+        path
+        for path in canonical_root.rglob("*.md")
+        if path.is_file()
+    )
+
+
+METADATA_PATH_KEYS = (
+    "img_path",
+    "image_path",
+    "asset_path",
+    "image",
+    "path",
+)
+METADATA_CAPTION_KEYS = (
+    "image_caption",
+    "table_caption",
+    "chart_caption",
+    "caption",
+)
+
+
+def _metadata_files(root: Path) -> list[Path]:
+    filenames = {"content_list.json", "content_list_v2.json"}
+    return sorted(
+        path
+        for path in root.rglob("*.json")
+        if path.is_file()
+        and (
+            path.name.casefold() in filenames
+            or (
+                path.name.casefold().endswith("_content_list.json")
+                and len(path.name) > len("_content_list.json")
+            )
+        )
+    )
+
+
+def _metadata_records(value, inherited=None):
+    inherited = {} if inherited is None else inherited
+    if isinstance(value, list):
+        for item in value:
+            yield from _metadata_records(item, inherited)
+        return
+    if not isinstance(value, dict):
+        return
+
+    local = dict(inherited)
+    local.update(
+        (key, item)
+        for key, item in value.items()
+        if not isinstance(item, dict)
+    )
+    if any(
+        key in value and isinstance(value[key], (str, Path))
+        for key in METADATA_PATH_KEYS
+    ):
+        yield local
+
+    for item in value.values():
+        if isinstance(item, (dict, list)):
+            yield from _metadata_records(item, local)
+
+
+def _caption_text(record: dict[str, object]) -> str:
+    for key in METADATA_CAPTION_KEYS:
+        value = record.get(key)
+        if isinstance(value, str):
+            caption = value.strip()
+            if caption:
+                return caption
+        if isinstance(value, list):
+            parts = [
+                item.strip()
+                for item in value
+                if isinstance(item, str) and item.strip()
+            ]
+            if parts:
+                return " ".join(parts)
+    return ""
+
+
+def _metadata_asset_path(
+    record: dict[str, object],
+    metadata_path: Path,
+    root: Path,
+) -> Path | None:
+    raw_path = next(
+        (
+            record[key]
+            for key in METADATA_PATH_KEYS
+            if isinstance(record.get(key), (str, Path))
+            and str(record[key]).strip()
+        ),
+        None,
+    )
+    if raw_path is None:
+        return None
+
+    decoded_path = unquote(
+        _without_url_suffix(html.unescape(str(raw_path).strip()))
+    )
+    if not decoded_path:
+        return None
+    parsed_path = Path(decoded_path)
+    if (
+        not parsed_path.is_absolute()
+        and re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", decoded_path)
+    ):
+        return None
+
+    canonical_root = root.resolve(strict=False)
+    if parsed_path.is_absolute():
+        candidates = [parsed_path.resolve(strict=False)]
+    else:
+        candidates = [
+            (metadata_path.parent / parsed_path).resolve(strict=False),
+            (canonical_root / parsed_path).resolve(strict=False),
+        ]
+    contained = [
+        candidate
+        for candidate in candidates
+        if candidate.is_relative_to(canonical_root)
+    ]
+    if not contained:
+        return None
+    candidate = next(
+        (path for path in contained if path.exists()),
+        contained[0],
+    )
+    if candidate.suffix.casefold() not in SUPPORTED_IMAGE_EXTENSIONS:
+        return None
+    return candidate
+
+
+def load_mineru_metadata(
+    root: Path,
+) -> dict[Path, list[dict[str, object]]]:
+    canonical_root = root.resolve(strict=False)
+    metadata: dict[Path, list[dict[str, object]]] = {}
+    seen: set[tuple[Path, str, str, str]] = set()
+    for metadata_path in _metadata_files(canonical_root):
+        try:
+            value = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        source = metadata_path.stem
+        for record in _metadata_records(value):
+            asset_path = _metadata_asset_path(
+                record, metadata_path, canonical_root
+            )
+            if asset_path is None:
+                continue
+            visual_type = next(
+                (
+                    str(record[key]).strip()
+                    for key in ("visual_type", "sub_type", "type")
+                    if record.get(key) is not None
+                    and str(record[key]).strip()
+                ),
+                "image",
+            )
+            evidence = {
+                "path": str(asset_path),
+                "caption": _caption_text(record),
+                "visual_type": visual_type,
+                "page_idx": record.get(
+                    "page_idx",
+                    record.get("page_index", record.get("page")),
+                ),
+                "bbox": record.get("bbox"),
+                "source": source,
+            }
+            identity = (
+                asset_path,
+                repr(evidence),
+                source,
+                str(metadata_path),
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            metadata.setdefault(asset_path, []).append(evidence)
+    return {
+        path: metadata[path]
+        for path in sorted(metadata)
+    }
+
+
+def build_asset_graph(
+    root: Path,
+) -> tuple[list[Path], dict[Path, AssetRecord], list[dict[str, str]]]:
+    canonical_root = root.resolve(strict=False)
+    documents = iter_markdown_files(canonical_root)
+    grouped: dict[Path, list[Reference]] = {}
+    for document in documents:
+        for reference in scan_markdown(document, canonical_root):
+            if (
+                reference.asset_path.suffix.casefold()
+                not in SUPPORTED_IMAGE_EXTENSIONS
+            ):
+                continue
+            grouped.setdefault(reference.asset_path, []).append(reference)
+
+    metadata = load_mineru_metadata(canonical_root)
+    assets: dict[Path, AssetRecord] = {}
+    warnings: list[dict[str, str]] = []
+    referenced_directories: set[Path] = set()
+    for asset_path in sorted(grouped):
+        referenced_directories.add(asset_path.parent)
+        if not asset_path.is_file():
+            warnings.append(
+                {
+                    "code": "missing-asset",
+                    "path": str(asset_path),
+                }
+            )
+            continue
+        assets[asset_path] = AssetRecord(
+            path=asset_path,
+            sha256=sha256_file(asset_path),
+            references=grouped[asset_path],
+            evidence=list(metadata.get(asset_path, [])),
+        )
+
+    referenced_paths = set(grouped)
+    unreferenced_paths: set[Path] = set()
+    for directory in sorted(referenced_directories):
+        if not directory.is_dir():
+            continue
+        for candidate in directory.rglob("*"):
+            if (
+                not candidate.is_file()
+                or candidate.suffix.casefold()
+                not in SUPPORTED_IMAGE_EXTENSIONS
+            ):
+                continue
+            canonical_candidate = candidate.resolve(strict=False)
+            if (
+                canonical_candidate.is_relative_to(canonical_root)
+                and canonical_candidate not in referenced_paths
+            ):
+                unreferenced_paths.add(canonical_candidate)
+    warnings.extend(
+        {
+            "code": "unreferenced-asset",
+            "path": str(path),
+        }
+        for path in sorted(unreferenced_paths)
+    )
+    return documents, assets, warnings
 
 
 def main(argv=None) -> int:
