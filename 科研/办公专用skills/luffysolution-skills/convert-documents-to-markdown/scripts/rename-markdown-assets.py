@@ -804,37 +804,47 @@ def load_mineru_metadata(
                 metadata_path.read_text(encoding="utf-8"),
                 parse_int=_safe_json_integer,
             )
-        except (OSError, UnicodeError, json.JSONDecodeError):
+            source = metadata_path.stem
+            file_evidence = []
+            file_seen = set()
+            for record in _metadata_records(value):
+                page_valid, page_index = _parse_page_index(record)
+                if not page_valid or not _valid_metadata_record(record):
+                    continue
+                asset_path = _metadata_asset_path(
+                    record, metadata_path, canonical_root
+                )
+                if asset_path is None:
+                    continue
+                evidence = {
+                    "path": str(asset_path),
+                    "caption": _caption_text(record),
+                    "visual_type": _visual_type(record),
+                    "page_idx": page_index,
+                    "bbox": _bbox(record),
+                    "source": source,
+                }
+                identity = (
+                    metadata_path,
+                    asset_path,
+                    evidence["caption"],
+                    evidence["visual_type"],
+                    evidence["page_idx"],
+                    repr(evidence["bbox"]),
+                )
+                if identity in seen or identity in file_seen:
+                    continue
+                file_seen.add(identity)
+                file_evidence.append((asset_path, evidence))
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            RecursionError,
+        ):
             continue
-        source = metadata_path.stem
-        for record in _metadata_records(value):
-            page_valid, page_index = _parse_page_index(record)
-            if not page_valid or not _valid_metadata_record(record):
-                continue
-            asset_path = _metadata_asset_path(
-                record, metadata_path, canonical_root
-            )
-            if asset_path is None:
-                continue
-            evidence = {
-                "path": str(asset_path),
-                "caption": _caption_text(record),
-                "visual_type": _visual_type(record),
-                "page_idx": page_index,
-                "bbox": _bbox(record),
-                "source": source,
-            }
-            identity = (
-                metadata_path,
-                asset_path,
-                evidence["caption"],
-                evidence["visual_type"],
-                evidence["page_idx"],
-                repr(evidence["bbox"]),
-            )
-            if identity in seen:
-                continue
-            seen.add(identity)
+        seen.update(file_seen)
+        for asset_path, evidence in file_evidence:
             metadata.setdefault(asset_path, []).append(evidence)
     return {
         path: metadata[path]

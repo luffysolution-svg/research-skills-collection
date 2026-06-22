@@ -1,9 +1,10 @@
 import ast
 import importlib.util
+import io
 import json
-import re
 import sys
 import tempfile
+import tokenize
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -13,6 +14,30 @@ SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "rename-markdown-assets.py
 SPEC = importlib.util.spec_from_file_location("rename_markdown_assets", SCRIPT_PATH)
 rename_markdown_assets = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(rename_markdown_assets)
+
+
+def parenthesized_multi_with_lines(source):
+    ignored = {
+        tokenize.COMMENT,
+        tokenize.ENCODING,
+        tokenize.INDENT,
+        tokenize.DEDENT,
+        tokenize.NEWLINE,
+        tokenize.NL,
+    }
+    tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+    expect_context = False
+    found = []
+    for token in tokens:
+        if token.type in ignored:
+            continue
+        if expect_context:
+            if token.type == tokenize.OP and token.string == "(":
+                found.append(token.start[0])
+            expect_context = False
+        elif token.type == tokenize.NAME and token.string == "with":
+            expect_context = True
+    return found
 
 
 class RenameMarkdownAssetsTests(unittest.TestCase):
@@ -68,10 +93,34 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
                 )
             ]
             self.assertEqual(pep604_annotations, [], str(path))
-            self.assertIsNone(
-                re.search(r"(?m)^\s*with\s*\(\s*$", source),
+            self.assertEqual(
+                parenthesized_multi_with_lines(source),
+                [],
                 str(path),
             )
+
+    def test_parenthesized_multi_with_detector_handles_layouts(self):
+        self.assertEqual(
+            parenthesized_multi_with_lines("with (a, b):\n    pass\n"),
+            [1],
+        )
+        self.assertEqual(
+            parenthesized_multi_with_lines(
+                "with (\n"
+                "    a,\n"
+                "    b,\n"
+                "):\n"
+                "    pass\n"
+            ),
+            [1],
+        )
+        self.assertEqual(
+            parenthesized_multi_with_lines(
+                "with open('a') as stream:\n"
+                "    pass\n"
+            ),
+            [],
+        )
 
     def test_sha256_file_returns_full_lowercase_digest(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1169,6 +1218,26 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             metadata[valid.resolve()][0]["bbox"],
             [0, 1, 2, 3],
         )
+
+    def test_metadata_skips_deeply_nested_file_and_loads_later_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image = root / "images" / "valid.png"
+            image.parent.mkdir()
+            image.write_bytes(b"valid")
+            depth = 2000
+            (root / "a_content_list.json").write_text(
+                "[" * depth + "0" + "]" * depth,
+                encoding="utf-8",
+            )
+            self.write_json(
+                root / "b_content_list.json",
+                [{"img_path": "images/valid.png", "page_idx": 2}],
+            )
+
+            metadata = rename_markdown_assets.load_mineru_metadata(root)
+
+        self.assertEqual(metadata[image.resolve()][0]["page_idx"], 2)
 
     def test_metadata_skips_invalid_asset_paths(self):
         with tempfile.TemporaryDirectory() as temp_dir:
