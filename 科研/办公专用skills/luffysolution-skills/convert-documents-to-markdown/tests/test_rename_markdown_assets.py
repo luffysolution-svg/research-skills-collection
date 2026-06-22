@@ -1239,6 +1239,46 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
 
         self.assertEqual(metadata[image.resolve()][0]["page_idx"], 2)
 
+    def test_metadata_traversal_failure_discards_staged_file_evidence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images = root / "images"
+            images.mkdir()
+            partial = images / "partial.png"
+            valid = images / "valid.png"
+            partial.write_bytes(b"partial")
+            valid.write_bytes(b"valid")
+            self.write_json(
+                root / "a_content_list.json",
+                {"marker": "fail-during-traversal"},
+            )
+            self.write_json(
+                root / "b_content_list.json",
+                {"marker": "valid"},
+            )
+
+            def records(value, inherited=None):
+                if value["marker"] == "fail-during-traversal":
+                    yield {
+                        "img_path": "images/partial.png",
+                        "page_idx": 1,
+                    }
+                    raise RecursionError("nested metadata traversal")
+                yield {
+                    "img_path": "images/valid.png",
+                    "page_idx": 2,
+                }
+
+            with patch.object(
+                rename_markdown_assets,
+                "_metadata_records",
+                new=records,
+            ):
+                metadata = rename_markdown_assets.load_mineru_metadata(root)
+
+        self.assertNotIn(partial.resolve(), metadata)
+        self.assertEqual(metadata[valid.resolve()][0]["page_idx"], 2)
+
     def test_metadata_skips_invalid_asset_paths(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
