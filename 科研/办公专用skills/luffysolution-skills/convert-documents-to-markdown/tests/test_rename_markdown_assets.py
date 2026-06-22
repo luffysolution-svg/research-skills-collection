@@ -971,7 +971,7 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             ],
         )
 
-    def test_metadata_skips_bad_paths_and_normalizes_malformed_fields(self):
+    def test_metadata_accepts_missing_optional_fields_with_defaults(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             image = root / "images" / "valid.png"
@@ -979,25 +979,7 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             image.write_bytes(b"valid")
             self.write_json(
                 root / "content_list.json",
-                [
-                    {"img_path": ""},
-                    {"img_path": "images/bad\u0000.png"},
-                    {"img_path": "images/not-supported.txt"},
-                    {
-                        "img_path": "images/valid.png",
-                        "caption": {"bad": "shape"},
-                        "page_idx": -1,
-                        "bbox": [1, float("nan"), 3, 4],
-                        "type": ["bad-shape"],
-                    },
-                    {
-                        "img_path": "images/valid.png",
-                        "caption": [" First ", 7, "", "Second"],
-                        "page_idx": 4.0,
-                        "bbox": [1, 2, 3, 4],
-                        "type": " image ",
-                    },
-                ],
+                [{"img_path": "images/valid.png"}],
             )
 
             metadata = rename_markdown_assets.load_mineru_metadata(root)
@@ -1012,17 +994,129 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
                     "page_idx": None,
                     "bbox": None,
                     "source": "content_list",
-                },
-                {
-                    "path": str(image.resolve()),
-                    "caption": "First Second",
-                    "visual_type": "image",
-                    "page_idx": 4,
-                    "bbox": [1, 2, 3, 4],
-                    "source": "content_list",
-                },
+                }
             ],
         )
+
+    def test_metadata_skips_records_with_explicit_invalid_optional_fields(self):
+        invalid_fields = [
+            ("caption-object", {"caption": {"bad": "shape"}}),
+            ("caption-number", {"caption": 7}),
+            ("caption-mixed-list", {"caption": ["valid", 7]}),
+            ("type-list", {"type": ["image"]}),
+            ("type-object", {"visual_type": {"kind": "image"}}),
+            ("type-empty", {"sub_type": ""}),
+            ("page-negative", {"page_idx": -1}),
+            ("page-float", {"page_index": 4.0}),
+            ("page-bool", {"page": True}),
+            ("page-spaced-string", {"page_idx": " 4 "}),
+            ("page-signed-string", {"page_idx": "+4"}),
+            ("page-decimal-string", {"page_idx": "4.0"}),
+            ("bbox-object", {"bbox": {"left": 1}}),
+            ("bbox-empty", {"bbox": []}),
+            ("bbox-bool", {"bbox": [1, True, 3, 4]}),
+            ("bbox-nan", {"bbox": [1, float("nan"), 3, 4]}),
+            ("bbox-infinity", {"bbox": [1, float("inf"), 3, 4]}),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images = root / "images"
+            images.mkdir()
+            records = []
+            for name, fields in invalid_fields:
+                image = images / f"{name}.png"
+                image.write_bytes(name.encode())
+                records.append(
+                    {"img_path": f"images/{image.name}", **fields}
+                )
+            self.write_json(root / "content_list.json", records)
+
+            metadata = rename_markdown_assets.load_mineru_metadata(root)
+
+        self.assertEqual(metadata, {})
+
+    def test_metadata_skips_invalid_asset_paths(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.write_json(
+                root / "content_list.json",
+                [
+                    {"img_path": ""},
+                    {"img_path": "images/bad\u0000.png"},
+                    {"img_path": "images/not-supported.txt"},
+                ],
+            )
+
+            metadata = rename_markdown_assets.load_mineru_metadata(root)
+
+        self.assertEqual(metadata, {})
+
+    def test_metadata_files_reject_canonical_escapes_and_deduplicate_aliases(
+        self,
+    ):
+        root = Path("C:/workspace").resolve(strict=False)
+        metadata = root / "content_list.json"
+        alias = root / "alias_content_list.json"
+        outside_link = root / "outside_content_list.json"
+        outside = Path("C:/outside/content_list.json").resolve(strict=False)
+        real_resolve = Path.resolve
+
+        def resolve_candidates(path, strict=False):
+            if path == alias:
+                return metadata
+            if path == outside_link:
+                return outside
+            return real_resolve(path, strict=strict)
+
+        with (
+            patch.object(
+                Path,
+                "rglob",
+                autospec=True,
+                return_value=[outside_link, alias, metadata],
+            ),
+            patch.object(Path, "is_file", autospec=True, return_value=True),
+            patch.object(
+                Path,
+                "resolve",
+                autospec=True,
+                side_effect=resolve_candidates,
+            ),
+        ):
+            metadata_files = rename_markdown_assets._metadata_files(root)
+
+        self.assertEqual(metadata_files, [metadata])
+
+    def test_unreferenced_scan_prunes_nested_referenced_directories(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images = root / "images"
+            nested = images / "nested"
+            nested.mkdir(parents=True)
+            (images / "parent.png").write_bytes(b"parent")
+            (nested / "child.png").write_bytes(b"child")
+            (root / "report.md").write_text(
+                "![parent](images/parent.png)\n"
+                "![child](images/nested/child.png)\n",
+                encoding="utf-8",
+            )
+            real_rglob = Path.rglob
+            scanned = []
+
+            def tracking_rglob(path, pattern):
+                scanned.append((path.resolve(strict=False), pattern))
+                return real_rglob(path, pattern)
+
+            with patch.object(
+                Path,
+                "rglob",
+                autospec=True,
+                side_effect=tracking_rglob,
+            ):
+                rename_markdown_assets.build_asset_graph(root)
+
+        self.assertIn((images.resolve(), "*"), scanned)
+        self.assertNotIn((nested.resolve(), "*"), scanned)
 
     def test_missing_root_asset_does_not_expand_unreferenced_scan_scope(self):
         with tempfile.TemporaryDirectory() as temp_dir:

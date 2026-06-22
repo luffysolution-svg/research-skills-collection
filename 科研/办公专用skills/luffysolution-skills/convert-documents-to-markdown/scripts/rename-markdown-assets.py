@@ -555,16 +555,26 @@ METADATA_RECORD_KEYS = (
 
 
 def _metadata_files(root: Path) -> list[Path]:
-    return sorted(
-        path
-        for path in root.rglob("*.json")
-        if path.is_file()
-        and re.fullmatch(
-            r"(?:content_list(?:_v2)?|.+_content_list(?:_v2)?)\.json",
-            path.name,
-            re.IGNORECASE,
-        )
-    )
+    canonical_root = root.resolve(strict=False)
+    metadata_files: set[Path] = set()
+    for path in canonical_root.rglob("*.json"):
+        try:
+            canonical_path = path.resolve(strict=False)
+        except (OSError, RuntimeError):
+            continue
+        if (
+            not canonical_path.is_relative_to(canonical_root)
+            or not canonical_path.is_file()
+            or re.fullmatch(
+                r"(?:content_list(?:_v2)?|.+_content_list(?:_v2)?)\.json",
+                canonical_path.name,
+                re.IGNORECASE,
+            )
+            is None
+        ):
+            continue
+        metadata_files.add(canonical_path)
+    return sorted(metadata_files)
 
 
 def _metadata_records(value, inherited=None):
@@ -600,17 +610,18 @@ def _metadata_records(value, inherited=None):
 
 def _caption_text(record: dict[str, object]) -> str:
     for key in METADATA_CAPTION_KEYS:
-        value = record.get(key)
+        if key not in record:
+            continue
+        value = record[key]
         if isinstance(value, str):
             caption = re.sub(r"\s+", " ", value).strip()
             if caption:
                 return caption
-        if isinstance(value, (list, tuple)):
+        if isinstance(value, list):
             parts = [
                 re.sub(r"\s+", " ", item).strip()
                 for item in value
-                if isinstance(item, str)
-                and re.sub(r"\s+", " ", item).strip()
+                if re.sub(r"\s+", " ", item).strip()
             ]
             if parts:
                 return " ".join(parts)
@@ -640,20 +651,15 @@ def _page_index(record: dict[str, object]) -> int | None:
         return None
     if isinstance(value, int):
         return value if value >= 0 else None
-    if isinstance(value, float):
-        if math.isfinite(value) and value >= 0 and value.is_integer():
-            return int(value)
-        return None
     if isinstance(value, str):
-        normalized = value.strip()
-        if re.fullmatch(r"\+?\d+", normalized):
-            return int(normalized)
+        if re.fullmatch(r"\d+", value):
+            return int(value)
     return None
 
 
 def _bbox(record: dict[str, object]) -> list[int | float] | None:
     value = record.get("bbox")
-    if not isinstance(value, (list, tuple)) or not value:
+    if not isinstance(value, list) or not value:
         return None
     normalized = []
     for coordinate in value:
@@ -665,6 +671,48 @@ def _bbox(record: dict[str, object]) -> list[int | float] | None:
             return None
         normalized.append(coordinate)
     return normalized
+
+
+def _valid_metadata_record(record: dict[str, object]) -> bool:
+    for key in METADATA_CAPTION_KEYS:
+        if key not in record:
+            continue
+        value = record[key]
+        if not isinstance(value, (str, list)):
+            return False
+        if isinstance(value, list) and not all(
+            isinstance(item, str) for item in value
+        ):
+            return False
+
+    for key in METADATA_TYPE_KEYS:
+        if key not in record:
+            continue
+        value = record[key]
+        if (
+            not isinstance(value, str)
+            or not re.sub(r"\s+", " ", value).strip()
+        ):
+            return False
+
+    for key in METADATA_PAGE_KEYS:
+        if key not in record:
+            continue
+        value = record[key]
+        if (
+            isinstance(value, bool)
+            or not (
+                isinstance(value, int)
+                and value >= 0
+                or isinstance(value, str)
+                and re.fullmatch(r"\d+", value) is not None
+            )
+        ):
+            return False
+
+    if "bbox" in record and _bbox(record) is None:
+        return False
+    return True
 
 
 def _metadata_asset_path(
@@ -742,6 +790,8 @@ def load_mineru_metadata(
             continue
         source = metadata_path.stem
         for record in _metadata_records(value):
+            if not _valid_metadata_record(record):
+                continue
             asset_path = _metadata_asset_path(
                 record, metadata_path, canonical_root
             )
@@ -811,7 +861,17 @@ def build_asset_graph(
 
     referenced_paths = set(grouped)
     unreferenced_paths: set[Path] = set()
-    for directory in sorted(referenced_directories):
+    scan_directories: list[Path] = []
+    for directory in sorted(
+        referenced_directories, key=lambda path: (len(path.parts), path)
+    ):
+        if not any(
+            directory.is_relative_to(parent)
+            for parent in scan_directories
+        ):
+            scan_directories.append(directory)
+
+    for directory in scan_directories:
         if not directory.is_dir():
             continue
         for candidate in directory.rglob("*"):
