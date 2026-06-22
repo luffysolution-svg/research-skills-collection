@@ -8,6 +8,7 @@ import sys
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, Union
 from urllib.parse import unquote
 
 
@@ -117,7 +118,7 @@ def _line_bounds(text: str, start: int) -> tuple[int, int]:
 
 def _fence_line(
     text: str, line_start: int
-) -> tuple[int, str, int, str, int, int] | None:
+) -> Optional[tuple[int, str, int, str, int, int]]:
     content_end, next_line = _line_bounds(text, line_start)
     match = FENCE_LINE_PATTERN.match(text[line_start:content_end])
     if match is None:
@@ -161,7 +162,7 @@ def _fence_end(
 
 def _inline_code_end(
     text: str, start: int, delimiter: str
-) -> int | None:
+) -> Optional[int]:
     position = start + len(delimiter)
     while position < len(text):
         line_start = position == 0 or text[position - 1] == "\n"
@@ -232,7 +233,7 @@ def _without_url_suffix(destination: str) -> str:
 
 def destination_to_asset(
     markdown_path: Path, root: Path, raw_destination: str
-) -> tuple[str, Path] | None:
+) -> Optional[tuple[str, Path]]:
     entity_destination = html.unescape(raw_destination)
     scheme_destination = unquote(entity_destination)
     scheme_path = Path(scheme_destination)
@@ -267,7 +268,7 @@ def destination_to_asset(
 
 def _destination_span(
     text: str, opening_parenthesis: int
-) -> tuple[int, int] | None:
+) -> Optional[tuple[int, int]]:
     position = opening_parenthesis + 1
     while position < len(text) and text[position] in " \t\r\n":
         position += 1
@@ -327,7 +328,9 @@ def _destination_span(
     return (start, end) if position < len(text) and text[position] == ")" else None
 
 
-def _closing_bracket(text: str, opening_bracket: int) -> int | None:
+def _closing_bracket(
+    text: str, opening_bracket: int
+) -> Optional[int]:
     depth = 1
     position = opening_bracket + 1
     while position < len(text):
@@ -545,6 +548,7 @@ METADATA_CAPTION_KEYS = (
 )
 METADATA_TYPE_KEYS = ("visual_type", "sub_type", "type")
 METADATA_PAGE_KEYS = ("page_idx", "page_index", "page")
+MAX_METADATA_INTEGER_DIGITS = 4300
 METADATA_RECORD_KEYS = (
     METADATA_PATH_KEYS
     + METADATA_CAPTION_KEYS
@@ -608,6 +612,16 @@ def _metadata_records(value, inherited=None):
         yield merged
 
 
+def _safe_json_integer(value: str) -> Union[int, str]:
+    digits = value[1:] if value.startswith("-") else value
+    if len(digits) > MAX_METADATA_INTEGER_DIGITS:
+        return value
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
 def _caption_text(record: dict[str, object]) -> str:
     for key in METADATA_CAPTION_KEYS:
         if key not in record:
@@ -638,40 +652,52 @@ def _visual_type(record: dict[str, object]) -> str:
     return "image"
 
 
-def _page_index(record: dict[str, object]) -> int | None:
-    value = next(
-        (
-            record[key]
-            for key in METADATA_PAGE_KEYS
-            if key in record
-        ),
+def _parse_page_index(
+    record: dict[str, object],
+) -> tuple[bool, Optional[int]]:
+    key = next(
+        (key for key in METADATA_PAGE_KEYS if key in record),
         None,
     )
+    if key is None:
+        return True, None
+    value = record[key]
     if isinstance(value, bool):
-        return None
+        return False, None
     if isinstance(value, int):
-        return value if value >= 0 else None
+        return (True, value) if value >= 0 else (False, None)
     if isinstance(value, float):
         if math.isfinite(value) and value >= 0 and value.is_integer():
-            return int(value)
-        return None
+            return True, int(value)
+        return False, None
     if isinstance(value, str):
-        if re.fullmatch(r"\d+", value):
-            return int(value)
-    return None
+        if (
+            len(value) <= MAX_METADATA_INTEGER_DIGITS
+            and re.fullmatch(r"\d+", value)
+        ):
+            try:
+                return True, int(value)
+            except ValueError:
+                pass
+    return False, None
 
 
-def _bbox(record: dict[str, object]) -> list[int | float] | None:
+def _bbox(
+    record: dict[str, object],
+) -> Optional[list[Union[int, float]]]:
     value = record.get("bbox")
     if not isinstance(value, list) or not value:
         return None
     normalized = []
     for coordinate in value:
-        if (
-            isinstance(coordinate, bool)
-            or not isinstance(coordinate, (int, float))
-            or not math.isfinite(coordinate)
+        if isinstance(coordinate, bool) or not isinstance(
+            coordinate, (int, float)
         ):
+            return None
+        try:
+            if not math.isfinite(coordinate):
+                return None
+        except OverflowError:
             return None
         normalized.append(coordinate)
     return normalized
@@ -699,25 +725,6 @@ def _valid_metadata_record(record: dict[str, object]) -> bool:
         ):
             return False
 
-    for key in METADATA_PAGE_KEYS:
-        if key not in record:
-            continue
-        value = record[key]
-        if (
-            isinstance(value, bool)
-            or not (
-                isinstance(value, int)
-                and value >= 0
-                or isinstance(value, float)
-                and math.isfinite(value)
-                and value >= 0
-                and value.is_integer()
-                or isinstance(value, str)
-                and re.fullmatch(r"\d+", value) is not None
-            )
-        ):
-            return False
-
     if "bbox" in record and _bbox(record) is None:
         return False
     return True
@@ -727,7 +734,7 @@ def _metadata_asset_path(
     record: dict[str, object],
     metadata_path: Path,
     root: Path,
-) -> Path | None:
+) -> Optional[Path]:
     raw_path = next(
         (
             record[key]
@@ -793,12 +800,16 @@ def load_mineru_metadata(
     seen: set[tuple[object, ...]] = set()
     for metadata_path in _metadata_files(canonical_root):
         try:
-            value = json.loads(metadata_path.read_text(encoding="utf-8"))
+            value = json.loads(
+                metadata_path.read_text(encoding="utf-8"),
+                parse_int=_safe_json_integer,
+            )
         except (OSError, UnicodeError, json.JSONDecodeError):
             continue
         source = metadata_path.stem
         for record in _metadata_records(value):
-            if not _valid_metadata_record(record):
+            page_valid, page_index = _parse_page_index(record)
+            if not page_valid or not _valid_metadata_record(record):
                 continue
             asset_path = _metadata_asset_path(
                 record, metadata_path, canonical_root
@@ -809,7 +820,7 @@ def load_mineru_metadata(
                 "path": str(asset_path),
                 "caption": _caption_text(record),
                 "visual_type": _visual_type(record),
-                "page_idx": _page_index(record),
+                "page_idx": page_index,
                 "bbox": _bbox(record),
                 "source": source,
             }

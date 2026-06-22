@@ -1,5 +1,8 @@
+import ast
 import importlib.util
 import json
+import re
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,6 +30,48 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             json.dumps(value, ensure_ascii=False),
             encoding="utf-8",
         )
+
+    def test_sources_avoid_python_3_10_only_syntax(self):
+        for path in (SCRIPT_PATH, Path(__file__)):
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(
+                source,
+                filename=str(path),
+                feature_version=9,
+            )
+            annotations = []
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    annotations.append(node.returns)
+                    annotations.extend(
+                        argument.annotation
+                        for argument in (
+                            list(node.args.posonlyargs)
+                            + list(node.args.args)
+                            + list(node.args.kwonlyargs)
+                        )
+                    )
+                    if node.args.vararg is not None:
+                        annotations.append(node.args.vararg.annotation)
+                    if node.args.kwarg is not None:
+                        annotations.append(node.args.kwarg.annotation)
+                elif isinstance(node, ast.AnnAssign):
+                    annotations.append(node.annotation)
+            pep604_annotations = [
+                annotation
+                for annotation in annotations
+                if annotation is not None
+                and any(
+                    isinstance(item, ast.BinOp)
+                    and isinstance(item.op, ast.BitOr)
+                    for item in ast.walk(annotation)
+                )
+            ]
+            self.assertEqual(pep604_annotations, [], str(path))
+            self.assertIsNone(
+                re.search(r"(?m)^\s*with\s*\(\s*$", source),
+                str(path),
+            )
 
     def test_sha256_file_returns_full_lowercase_digest(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1058,6 +1103,73 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
 
         self.assertEqual(metadata[image.resolve()][0]["page_idx"], 4)
 
+    def test_metadata_skips_oversized_page_string_and_loads_later_record(self):
+        original_limit = (
+            sys.get_int_max_str_digits()
+            if hasattr(sys, "get_int_max_str_digits")
+            else None
+        )
+        try:
+            if hasattr(sys, "set_int_max_str_digits"):
+                sys.set_int_max_str_digits(0)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                images = root / "images"
+                images.mkdir()
+                invalid = images / "invalid.png"
+                valid = images / "valid.png"
+                invalid.write_bytes(b"invalid")
+                valid.write_bytes(b"valid")
+                self.write_json(
+                    root / "content_list.json",
+                    [
+                        {
+                            "img_path": "images/invalid.png",
+                            "page_idx": "9" * 5000,
+                        },
+                        {
+                            "img_path": "images/valid.png",
+                            "page_idx": 3,
+                        },
+                    ],
+                )
+
+                metadata = rename_markdown_assets.load_mineru_metadata(root)
+        finally:
+            if original_limit is not None:
+                sys.set_int_max_str_digits(original_limit)
+
+        self.assertNotIn(invalid.resolve(), metadata)
+        self.assertEqual(metadata[valid.resolve()][0]["page_idx"], 3)
+
+    def test_metadata_skips_oversized_bbox_int_and_loads_later_record(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images = root / "images"
+            images.mkdir()
+            invalid = images / "invalid.png"
+            valid = images / "valid.png"
+            invalid.write_bytes(b"invalid")
+            valid.write_bytes(b"valid")
+            oversized_integer = "1" + "0" * 10000
+            (root / "content_list.json").write_text(
+                "["
+                '{"img_path":"images/invalid.png","bbox":[0,'
+                + oversized_integer
+                + ',2,3]},'
+                '{"img_path":"images/valid.png","bbox":[0,1,2,3]}'
+                "]",
+                encoding="utf-8",
+            )
+
+            metadata = rename_markdown_assets.load_mineru_metadata(root)
+
+        self.assertNotIn(invalid.resolve(), metadata)
+        self.assertEqual(
+            metadata[valid.resolve()][0]["bbox"],
+            [0, 1, 2, 3],
+        )
+
     def test_metadata_skips_invalid_asset_paths(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1092,22 +1204,24 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
                 return outside
             return real_resolve(path, strict=strict)
 
-        with (
-            patch.object(
-                Path,
-                "rglob",
-                autospec=True,
-                return_value=[outside_link, second_alias, alias],
-            ),
-            patch.object(Path, "is_file", autospec=True, return_value=True),
-            patch.object(
-                Path,
-                "resolve",
-                autospec=True,
-                side_effect=resolve_candidates,
-            ),
+        with patch.object(
+            Path,
+            "rglob",
+            autospec=True,
+            return_value=[outside_link, second_alias, alias],
         ):
-            metadata_files = rename_markdown_assets._metadata_files(root)
+            with patch.object(
+                Path, "is_file", autospec=True, return_value=True
+            ):
+                with patch.object(
+                    Path,
+                    "resolve",
+                    autospec=True,
+                    side_effect=resolve_candidates,
+                ):
+                    metadata_files = rename_markdown_assets._metadata_files(
+                        root
+                    )
 
         self.assertEqual(metadata_files, [metadata])
 
@@ -1198,22 +1312,24 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
                 return outside
             return real_resolve(path, strict=strict)
 
-        with (
-            patch.object(
-                Path,
-                "rglob",
-                autospec=True,
-                return_value=[outside_link, alias, lower],
-            ),
-            patch.object(Path, "is_file", autospec=True, return_value=True),
-            patch.object(
-                Path,
-                "resolve",
-                autospec=True,
-                side_effect=resolve_candidates,
-            ),
+        with patch.object(
+            Path,
+            "rglob",
+            autospec=True,
+            return_value=[outside_link, alias, lower],
         ):
-            documents = rename_markdown_assets.iter_markdown_files(root)
+            with patch.object(
+                Path, "is_file", autospec=True, return_value=True
+            ):
+                with patch.object(
+                    Path,
+                    "resolve",
+                    autospec=True,
+                    side_effect=resolve_candidates,
+                ):
+                    documents = rename_markdown_assets.iter_markdown_files(
+                        root
+                    )
 
         self.assertEqual(documents, [lower])
 
