@@ -3,10 +3,11 @@
 按科研、开发和内容创作场景整理的 Agent Skills 导航与离线合集，适用于
 Claude Code、Codex 及兼容 `SKILL.md` 的 Agent。
 
-当前公开版本包含 **240 个 skills**，来自 **16 个上游项目**。
+当前公开版本包含 **241 个 skills**：其中 240 个来自 **16 个上游项目**，
+1 个为本仓库原创。
 
-> 本仓库是分类整理项目，不是这些 skills 的原创仓库。每个项目仍归原作者所有，
-> 并遵循其自己的许可证。使用前请阅读
+> 本仓库以分类整理为主；除明确标注为“本仓库原创”的 skills 外，其余项目仍归
+> 原作者所有，并遵循其自己的许可证。使用前请阅读
 > [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 目录
@@ -52,7 +53,7 @@ Claude Code、Codex 及兼容 `SKILL.md` 的 Agent。
 | 科研/化学 | 12 |
 | 科研/环境 | 2 |
 | 科研/材料 | 1 |
-| 科研/办公专用 | 23 |
+| 科研/办公专用 | 24 |
 | 科研/构思 | 7 |
 | 科研/审核 | 7 |
 | 科研/文献管理 | 13 |
@@ -96,6 +97,12 @@ Claude Code、Codex 及兼容 `SKILL.md` 的 Agent。
 | [K-Dense-AI/scientific-agent-skills](https://github.com/K-Dense-AI/scientific-agent-skills) | 143 |
 | [Leonxlnx/taste-skill](https://github.com/Leonxlnx/taste-skill) | 13 |
 
+## 本仓库原创 Skills
+
+| Skill | 分类 | 说明 |
+|---|---|---|
+| `convert-documents-to-markdown` | 科研/办公专用 | 自动选择 MarkItDown、OCR 或 MinerU，将文档转换为经过验证的 Markdown |
+
 ## 未再分发的官方 Skills
 
 以下内容只在安装指南中提供官方安装方法，不随本仓库再分发：
@@ -112,5 +119,6 @@ Claude Code、Codex 及兼容 `SKILL.md` 的 Agent。
 
 ## 免责声明
 
-本仓库仅进行目录分类、来源标注和安装说明整理，不提供任何上游项目的担保。
+本仓库提供目录分类、来源标注、安装说明及明确标注的原创 Skills，不提供任何
+上游项目的担保。
 医疗、法律、金融或实验安全相关内容必须由具备资质的人员复核。
