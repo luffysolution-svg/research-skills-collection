@@ -184,6 +184,28 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             raw_destination,
         )
 
+    def test_scan_markdown_rejects_destinations_empty_after_url_normalization(self):
+        markdown = (
+            "![fragment](#preview)\n"
+            "![query](?width=2)\n"
+            '<img src="">\n'
+            "![valid](images/valid.png)\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "valid.png").write_bytes(b"asset")
+
+            references = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )
+
+        self.assertEqual(
+            [reference.decoded_destination for reference in references],
+            ["images/valid.png"],
+        )
+
     def test_scan_markdown_records_utf8_byte_offsets_for_cjk_and_crlf(self):
         markdown = (
             "标题\r\n"
@@ -236,6 +258,26 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
         self.assertEqual(
             [reference.decoded_destination for reference in references],
             ["images/used.png"],
+        )
+
+    def test_scan_markdown_supports_escaped_closing_bracket_in_definition_label(self):
+        markdown = (
+            "![escaped label][a\\]]\n"
+            "[a\\]]: images/a.png\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "a.png").write_bytes(b"asset")
+
+            references = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )
+
+        self.assertEqual(
+            [reference.decoded_destination for reference in references],
+            ["images/a.png"],
         )
 
     def test_scan_markdown_shortcut_uses_first_normalized_definition(self):
@@ -308,6 +350,28 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             references[0].decoded_destination, "images/a b.png"
         )
         self.assertEqual(references[0].asset_path, images / "a b.png")
+
+    def test_scan_markdown_rejects_inline_images_without_closing_parenthesis(self):
+        markdown = (
+            "![plain](images/plain.png\n"
+            '![title](images/title.png "caption"\n'
+            "![valid](images/valid.png)\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            for name in ("plain.png", "title.png", "valid.png"):
+                (images / name).write_bytes(b"asset")
+
+            references = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )
+
+        self.assertEqual(
+            [reference.decoded_destination for reference in references],
+            ["images/valid.png"],
+        )
 
     def test_scan_markdown_preserves_escaped_fragment_character(self):
         markdown = "![hash](images/a\\#b.png)\n"
@@ -476,6 +540,91 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
         self.assertEqual(
             protected_text,
             ["`inline`", "````python\nfenced\n````", "<!-- comment -->"],
+        )
+
+    def test_fenced_comment_does_not_protect_content_after_fence(self):
+        markdown = (
+            "```\n"
+            "<!-- unclosed inside fence\n"
+            "```\n"
+            "![after](images/after.png)\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "after.png").write_bytes(b"asset")
+
+            references = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )
+
+        self.assertEqual(
+            [reference.decoded_destination for reference in references],
+            ["images/after.png"],
+        )
+
+    def test_inline_code_does_not_use_closer_inside_fenced_code(self):
+        markdown = (
+            "`unclosed inline\n"
+            "```\n"
+            "` closer inside fence\n"
+            "```\n"
+        )
+
+        ranges = rename_markdown_assets.protected_ranges(markdown)
+        protected_text = [markdown[start:end] for start, end in ranges]
+
+        self.assertEqual(
+            protected_text,
+            ["```\n` closer inside fence\n```"],
+        )
+
+    def test_blockquoted_fence_protects_images(self):
+        markdown = (
+            "> ~~~markdown\n"
+            "> ![inside tilde](images/inside-tilde.png)\n"
+            "> ~~~\n"
+            "> ```markdown\n"
+            "> ![inside backtick](images/inside-backtick.png)\n"
+            "> ```\n"
+            "![outside](images/outside.png)\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "inside-tilde.png").write_bytes(b"asset")
+            (images / "inside-backtick.png").write_bytes(b"asset")
+            (images / "outside.png").write_bytes(b"asset")
+
+            references = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )
+
+        self.assertEqual(
+            [reference.decoded_destination for reference in references],
+            ["images/outside.png"],
+        )
+
+    def test_backtick_in_fence_info_does_not_open_fence(self):
+        markdown = (
+            "```python`invalid\n"
+            "![visible](images/visible.png)\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "visible.png").write_bytes(b"asset")
+
+            references = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )
+
+        self.assertEqual(
+            [reference.decoded_destination for reference in references],
+            ["images/visible.png"],
         )
 
 

@@ -95,20 +95,20 @@ def _is_escaped(text: str, position: int) -> bool:
 
 
 def protected_ranges(text: str) -> list[tuple[int, int]]:
-    ranges = [
-        (match.start(), match.end())
-        for match in re.finditer(r"<!--.*?(?:-->|$)", text, re.DOTALL)
-    ]
-
+    ranges: list[tuple[int, int]] = []
     fence_pattern = re.compile(
-        r"(?m)^ {0,3}(?P<fence>`{3,}|~{3,})[^\r\n]*(?:\r?\n|$)"
+        r"(?m)^(?P<prefix>(?: {0,3}>[ \t]?)* {0,3})"
+        r"(?P<fence>`{3,}|~{3,})(?P<info>[^\r\n]*)(?:\r?\n|$)"
     )
     for opener in fence_pattern.finditer(text):
         if _overlaps(ranges, opener.start(), opener.end()):
             continue
         fence = opener.group("fence")
+        if fence[0] == "`" and "`" in opener.group("info"):
+            continue
+        prefix = opener.group("prefix")
         closer_pattern = re.compile(
-            rf"(?m)^ {{0,3}}{re.escape(fence[0])}"
+            rf"(?m)^{re.escape(prefix)}{re.escape(fence[0])}"
             rf"{{{len(fence)},}}[ \t]*(?=\r?$)"
         )
         closer = closer_pattern.search(text, opener.end())
@@ -116,6 +116,22 @@ def protected_ranges(text: str) -> list[tuple[int, int]]:
         ranges.append((opener.start(), end))
 
     ranges = _merge_ranges(ranges)
+    position = 0
+    while position < len(text):
+        start = text.find("<!--", position)
+        if start == -1:
+            break
+        if _overlaps(ranges, start, start + 4):
+            position = start + 4
+            continue
+        end = text.find("-->", start + 4)
+        while end != -1 and _overlaps(ranges, end, end + 3):
+            end = text.find("-->", end + 3)
+        end = end + 3 if end != -1 else len(text)
+        ranges.append((start, end))
+        ranges = _merge_ranges(ranges)
+        position = end
+
     position = 0
     while position < len(text):
         opener = re.search(r"`+", text[position:])
@@ -133,6 +149,7 @@ def protected_ranges(text: str) -> list[tuple[int, int]]:
         end = text.find(run, search_from)
         while end != -1 and (
             _is_escaped(text, end)
+            or _overlaps(ranges, end, end + len(run))
             or (end > 0 and text[end - 1] == "`")
             or (
                 end + len(run) < len(text)
@@ -175,6 +192,8 @@ def destination_to_asset(
         r"\1",
         decoded_destination,
     )
+    if not decoded_destination:
+        return None
     destination_path = Path(decoded_destination)
 
     canonical_root = root.resolve(strict=False)
@@ -206,29 +225,48 @@ def _destination_span(
             if text[position] == ">" and (
                 position == start or text[position - 1] != "\\"
             ):
-                return start, position
-            position += 1
-        return None
-
-    start = position
-    nested_parentheses = 0
-    while position < len(text):
-        character = text[position]
-        if character == "\\":
-            position += 2
-            continue
-        if character == "(":
-            nested_parentheses += 1
-        elif character == ")":
-            if nested_parentheses == 0:
+                end = position
+                position += 1
                 break
-            nested_parentheses -= 1
-        elif character.isspace() and nested_parentheses == 0:
-            break
+            position += 1
+        else:
+            return None
+    else:
+        start = position
+        nested_parentheses = 0
+        while position < len(text):
+            character = text[position]
+            if character == "\\":
+                position += 2
+                continue
+            if character == "(":
+                nested_parentheses += 1
+            elif character == ")":
+                if nested_parentheses == 0:
+                    break
+                nested_parentheses -= 1
+            elif character.isspace() and nested_parentheses == 0:
+                break
+            position += 1
+        if position == start:
+            return None
+        end = position
+
+    while position < len(text) and text[position] in " \t\r\n":
         position += 1
-    if position == start:
-        return None
-    return start, position
+    if position < len(text) and text[position] in "\"'":
+        quote = text[position]
+        position += 1
+        while position < len(text):
+            if text[position] == quote and not _is_escaped(text, position):
+                position += 1
+                break
+            position += 1
+        else:
+            return None
+        while position < len(text) and text[position] in " \t\r\n":
+            position += 1
+    return (start, end) if position < len(text) and text[position] == ")" else None
 
 
 def _closing_bracket(text: str, opening_bracket: int) -> int | None:
@@ -337,22 +375,42 @@ def scan_markdown(path: Path, root: Path) -> list[Reference]:
         used_labels.add(_reference_label(alt))
         position = following
 
-    definition_pattern = re.compile(
-        r"(?m)^[ \t]{0,3}\[(?P<label>[^\]\r\n]+)\]:[ \t]*"
-        r"(?:<(?P<angle>[^>\r\n]*)>|(?P<plain>\S+))"
-    )
     defined_labels: set[str] = set()
-    for match in definition_pattern.finditer(text):
-        if _overlaps(protected, match.start(), match.end()):
+    definition_start_pattern = re.compile(r"(?m)^[ \t]{0,3}\[")
+    for match in definition_start_pattern.finditer(text):
+        label_end = _closing_bracket(text, match.end() - 1)
+        if label_end is None:
             continue
-        label = _reference_label(match.group("label"))
+        position = label_end + 1
+        if position >= len(text) or text[position] != ":":
+            continue
+        position += 1
+        while position < len(text) and text[position] in " \t":
+            position += 1
+        if position >= len(text) or text[position] in "\r\n":
+            continue
+        if text[position] == "<":
+            start = position + 1
+            end = start
+            while end < len(text) and text[end] not in "\r\n":
+                if text[end] == ">" and not _is_escaped(text, end):
+                    break
+                end += 1
+            if end >= len(text) or text[end] != ">":
+                continue
+        else:
+            start = position
+            end = start
+            while end < len(text) and not text[end].isspace():
+                end += 1
+        if start == end or _overlaps(protected, match.start(), end):
+            continue
+        label = _reference_label(text[match.end() : label_end])
         if label in defined_labels:
             continue
         defined_labels.add(label)
         if label not in used_labels:
             continue
-        group = "angle" if match.group("angle") is not None else "plain"
-        start, end = match.span(group)
         add_reference("markdown-reference", start, end, text[start:end])
 
     image_tag_pattern = re.compile(
