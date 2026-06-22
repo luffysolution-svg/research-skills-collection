@@ -1740,15 +1740,45 @@ def _apply_optional_vision(
     return status_by_path, config, vision_calls
 
 
-def check_vision() -> int:
+def _vision_status_payload() -> dict[str, object]:
     config = load_vision_config()
-    status = {
+    return {
         "api_key_configured": bool(config["configured"]),
         "base_url_classification": config["base_url_classification"],
         "model": config["model"],
         "prompt_version": PROMPT_VERSION,
     }
-    print(json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def _print_json(value: dict[str, object]) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def _print_human_summary(summary: dict[str, object]) -> None:
+    for key in (
+        "documents",
+        "unique_references",
+        "eligible_assets",
+        "missing_assets",
+        "unreferenced_assets",
+        "vision_needed_assets",
+        "vision_calls",
+        "warnings",
+    ):
+        print("{}: {}".format(key, summary.get(key, 0)))
+
+
+def check_vision(json_output: bool = True) -> int:
+    status = _vision_status_payload()
+    if json_output:
+        _print_json(status)
+    else:
+        print("api_key_configured: {}".format(status["api_key_configured"]))
+        print("base_url_classification: {}".format(
+            status["base_url_classification"]
+        ))
+        print("model: {}".format(status["model"]))
+        print("prompt_version: {}".format(status["prompt_version"]))
     return 0
 
 
@@ -1868,6 +1898,7 @@ def create_plan(
         vision_needed = len(vision_status_by_path)
     plan = {
         "schema": 1,
+        "root": canonical_root.as_posix(),
         "assets": entries,
         "summary": {
             "documents": len(documents),
@@ -2009,6 +2040,10 @@ def _entry_reference_documents(entry: object) -> list[str]:
 
 
 def _infer_plan_root(plan: dict[str, object], plan_path: Path) -> Path:
+    root_value = plan.get("root")
+    if isinstance(root_value, str) and root_value:
+        return Path(root_value).resolve(strict=False)
+
     assets = plan.get("assets", [])
     if not isinstance(assets, list):
         return plan_path.resolve(strict=False).parent
@@ -2742,15 +2777,140 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Safely rename referenced Markdown assets."
     )
-    subparsers = parser.add_subparsers(dest="command")
-    subparsers.add_parser(
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    plan_parser = subparsers.add_parser(
+        "plan",
+        help="Create a read-only semantic asset rename plan.",
+    )
+    plan_parser.add_argument("root", help="Markdown output root to scan.")
+    plan_parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory for rename-plan.json and rename-plan.csv.",
+    )
+    plan_parser.add_argument(
+        "--vision",
+        action="store_true",
+        help="Use approved optional vision fallback for generic assets.",
+    )
+    plan_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print a machine-readable summary.",
+    )
+
+    apply_parser = subparsers.add_parser(
+        "apply",
+        help="Apply a rename plan transactionally.",
+    )
+    apply_parser.add_argument("plan_path", help="Path to rename-plan.json.")
+    apply_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print a machine-readable result.",
+    )
+
+    validate_parser = subparsers.add_parser(
+        "validate",
+        help="Validate an applied rename plan.",
+    )
+    validate_parser.add_argument("plan_path", help="Path to rename-plan.json.")
+    validate_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable validation errors.",
+    )
+
+    rollback_parser = subparsers.add_parser(
+        "rollback",
+        help="Rollback a transaction journal.",
+    )
+    rollback_parser.add_argument(
+        "transaction_path",
+        help="Path to .rename-markdown-assets/.../transaction.json.",
+    )
+    rollback_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print a machine-readable rollback result.",
+    )
+
+    vision_parser = subparsers.add_parser(
         "check-vision",
         help="Show optional vision configuration without revealing secrets.",
     )
+    vision_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable configuration status.",
+    )
     args = parser.parse_args(argv)
-    if args.command == "check-vision":
-        return check_vision()
-    return 0
+    try:
+        if args.command == "plan":
+            root = Path(args.root)
+            output_dir = (
+                Path(args.output_dir)
+                if args.output_dir is not None
+                else root / ".rename-markdown-assets-plan"
+            )
+            plan = create_plan(root, output_dir, use_vision=args.vision)
+            summary = dict(plan.get("summary", {}))
+            summary["plan_path"] = (output_dir / "rename-plan.json").as_posix()
+            if args.json:
+                _print_json(summary)
+            else:
+                _print_human_summary(summary)
+                print("plan_path: {}".format(summary["plan_path"]))
+            return 0
+
+        if args.command == "apply":
+            result = apply_plan(Path(args.plan_path))
+            if args.json:
+                _print_json(result)
+            else:
+                print("state: {}".format(result["state"]))
+                print("transaction_path: {}".format(
+                    result["transaction_path"]
+                ))
+            return 0
+
+        if args.command == "validate":
+            errors = validate_plan(Path(args.plan_path))
+            payload = {"valid": not errors, "errors": errors}
+            if args.json:
+                _print_json(payload)
+            elif errors:
+                for error in errors:
+                    print("error: {}".format(error))
+            else:
+                print("valid: true")
+            return 2 if errors else 0
+
+        if args.command == "rollback":
+            errors = rollback_transaction(Path(args.transaction_path))
+            payload = {
+                "state": "rollback-incomplete" if errors else "rolled-back",
+                "errors": errors,
+            }
+            if args.json:
+                _print_json(payload)
+            elif errors:
+                for error in errors:
+                    print("error: {}".format(error))
+            else:
+                print("state: rolled-back")
+            return 3 if errors else 0
+
+        if args.command == "check-vision":
+            return check_vision(json_output=args.json)
+    except RuntimeError as exc:
+        if getattr(args, "json", False):
+            _print_json({"error": str(exc)})
+        else:
+            print("error: {}".format(exc))
+        return 2
+    return 2
 
 
 if __name__ == "__main__":

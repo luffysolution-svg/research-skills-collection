@@ -56,6 +56,12 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def capture_main(self, args):
+        stdout = io.StringIO()
+        with patch.object(sys, "stdout", stdout):
+            code = rename_markdown_assets.main(args)
+        return code, stdout.getvalue()
+
     def snapshot_source_tree(self, root):
         snapshot = {}
         for path in sorted((root / "docs").rglob("*")):
@@ -2457,6 +2463,64 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             any("unexpected rewritten references" in error for error in errors),
             errors,
         )
+
+    def test_cli_plan_outputs_json_summary_and_is_read_only(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, _markdown = self.make_markdown_tree(
+                temp_dir,
+                "![plot](images/a.png)\n",
+            )
+            asset = images / "a.png"
+            asset.write_bytes(b"asset")
+            output = root / "plan"
+            before = self.snapshot_source_tree(root)
+
+            code, stdout = self.capture_main(
+                ["plan", str(root), "--output-dir", str(output), "--json"]
+            )
+
+            payload = json.loads(stdout)
+            self.assertEqual(code, 0)
+            self.assertEqual(payload["eligible_assets"], 1)
+            self.assertEqual(payload["documents"], 1)
+            self.assertEqual(self.snapshot_source_tree(root), before)
+            self.assertTrue((output / "rename-plan.json").is_file())
+
+    def test_cli_apply_requires_explicit_plan_file(self):
+        with self.assertRaises(SystemExit):
+            rename_markdown_assets.main(["apply"])
+
+    def test_cli_validate_returns_nonzero_for_broken_reference(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, _markdown = self.make_markdown_tree(
+                temp_dir,
+                "![plot](images/a.png)\n",
+            )
+            (images / "a.png").write_bytes(b"asset")
+            output = root / "plan"
+            rename_markdown_assets.create_plan(root, output)
+
+            code, stdout = self.capture_main(
+                ["validate", str(output / "rename-plan.json"), "--json"]
+            )
+
+            payload = json.loads(stdout)
+            self.assertEqual(code, 2)
+            self.assertTrue(payload["errors"])
+
+    def test_cli_check_vision_json_hides_secret_values(self):
+        sentinel = "SECRET-SENTINEL-DO-NOT-WRITE"
+        with patch.dict(
+            rename_markdown_assets.os.environ,
+            {"MARKITDOWN_OCR_API_KEY": sentinel},
+            clear=False,
+        ):
+            code, stdout = self.capture_main(["check-vision", "--json"])
+
+        payload = json.loads(stdout)
+        self.assertEqual(code, 0)
+        self.assertTrue(payload["api_key_configured"])
+        self.assertNotIn(sentinel, stdout)
 
     def test_create_plan_uses_injected_vision_only_for_generic_assets(self):
         with tempfile.TemporaryDirectory() as temp_dir:
