@@ -1628,12 +1628,8 @@ def _apply_optional_vision(
                 validated = None
             if validated is not None:
                 status = _vision_status_for_result(validated)
-                if status == "used":
-                    status = "used-cache"
-                else:
-                    status = "{}-cache".format(status)
                 status_by_path[record.path] = status
-                if status == "used-cache":
+                if status == "used":
                     record.evidence = [
                         {
                             "caption": validated["description"],

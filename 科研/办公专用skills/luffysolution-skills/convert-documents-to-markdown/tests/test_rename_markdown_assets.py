@@ -2148,7 +2148,7 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
         self.assertEqual(first["assets"][0]["new_path"],
                          second["assets"][0]["new_path"])
         self.assertEqual(first["assets"][0]["vision_status"], "used")
-        self.assertEqual(second["assets"][0]["vision_status"], "used-cache")
+        self.assertEqual(second["assets"][0]["vision_status"], "used")
         self.assertEqual(first["summary"]["vision_calls"], 1)
         self.assertEqual(second["summary"]["vision_calls"], 0)
         self.assertNotIn("secret-test-key", cache_text)
