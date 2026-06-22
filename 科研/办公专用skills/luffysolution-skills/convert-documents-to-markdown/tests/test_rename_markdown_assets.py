@@ -1028,6 +1028,43 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             expected_sources,
         )
 
+    def test_metadata_files_discovery_is_case_insensitive_on_case_sensitive_fs(
+        self,
+    ):
+        root = Path("C:/workspace").resolve(strict=False)
+        uppercase = root / "CONTENT_LIST.JSON"
+        mixed = root / "report_content_list.JSON"
+        ignored = root / "notes.JSON"
+        real_resolve = Path.resolve
+
+        def resolve_candidates(path, strict=False):
+            return real_resolve(path, strict=strict)
+
+        def rglob_candidates(path, pattern):
+            self.assertEqual(pattern, "*")
+            return [ignored, mixed, uppercase]
+
+        with patch.object(
+            Path,
+            "rglob",
+            autospec=True,
+            side_effect=rglob_candidates,
+        ):
+            with patch.object(
+                Path, "is_file", autospec=True, return_value=True
+            ):
+                with patch.object(
+                    Path,
+                    "resolve",
+                    autospec=True,
+                    side_effect=resolve_candidates,
+                ):
+                    metadata_files = rename_markdown_assets._metadata_files(
+                        root
+                    )
+
+        self.assertEqual(metadata_files, sorted([uppercase, mixed]))
+
     def test_content_list_v2_merges_parent_path_with_nested_content(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1732,6 +1769,82 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             result[asset.resolve()].proposed_name.casefold(),
             blocker.name.casefold(),
         )
+
+    def test_collision_suffix_preserves_each_asset_content_hash(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            docs = root / "docs"
+            images = root / "images"
+            docs.mkdir()
+            images.mkdir()
+            first = images / "first.png"
+            second = images / "second.png"
+            first.write_bytes(b"first-content")
+            second.write_bytes(b"second-content")
+            (docs / "report.md").write_text(
+                "![Figure 1. Pressure curve](../images/first.png)\n"
+                "![Figure 1. Pressure curve](../images/second.png)\n",
+                encoding="utf-8",
+            )
+            first_hash = rename_markdown_assets.sha256_file(first)[:8]
+            second_hash = rename_markdown_assets.sha256_file(second)[:8]
+            for hash8 in (first_hash, second_hash):
+                blocker = images / rename_markdown_assets.safe_filename(
+                    "docs-report-fig01-pressure-curve",
+                    ".png",
+                    hash8,
+                )
+                blocker.write_bytes(b"blocker")
+            _documents, assets, _warnings = (
+                rename_markdown_assets.build_asset_graph(root)
+            )
+
+            result = rename_markdown_assets.propose_names(
+                root, assets, {}
+            )
+
+        first_name = result[first.resolve()].proposed_name
+        second_name = result[second.resolve()].proposed_name
+        self.assertIn("-" + first_hash + "-", first_name)
+        self.assertIn("-" + second_hash + "-", second_name)
+        self.assertNotEqual(first_name.casefold(), second_name.casefold())
+        self.assertEqual(
+            [first_name, second_name],
+            [
+                result[first.resolve()].proposed_name,
+                result[second.resolve()].proposed_name,
+            ],
+        )
+
+    def test_shared_asset_uses_neutral_slug_not_single_document_stem(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            docs = root / "docs"
+            images = root / "images"
+            docs.mkdir()
+            images.mkdir()
+            shared = images / "shared.png"
+            shared.write_bytes(b"shared")
+            (docs / "a.md").write_text(
+                "![Pressure curve](../images/shared.png)\n",
+                encoding="utf-8",
+            )
+            (docs / "b.md").write_text(
+                "![Pressure curve](../images/shared.png)\n",
+                encoding="utf-8",
+            )
+            _documents, assets, _warnings = (
+                rename_markdown_assets.build_asset_graph(root)
+            )
+
+            result = rename_markdown_assets.propose_names(
+                root, assets, {}
+            )
+
+        proposed = result[shared.resolve()].proposed_name
+        self.assertNotIn("docs-a", proposed)
+        self.assertNotIn("docs-b", proposed)
+        self.assertIn("shared", proposed)
 
     def test_create_plan_is_read_only_deterministic_and_has_stable_schema(self):
         with tempfile.TemporaryDirectory() as temp_dir:

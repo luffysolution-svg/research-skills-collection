@@ -85,6 +85,21 @@ def safe_filename(
     return f"{slug}{tail}"
 
 
+def _safe_filename_with_hashes(
+    stem: str,
+    suffix: str,
+    hashes: list[str],
+    limit: int = 120,
+) -> str:
+    slug = slugify(stem) or "asset"
+    if slug.casefold() in WINDOWS_RESERVED:
+        slug = "asset"
+    tail = f"-{'-'.join(hashes)}{suffix.lower()}"
+    available = max(1, limit - len(tail))
+    slug = slug[:available].rstrip("-") or "asset"
+    return f"{slug}{tail}"
+
+
 def _overlaps(ranges: list[tuple[int, int]], start: int, end: int) -> bool:
     return any(start < range_end and end > range_start
                for range_start, range_end in ranges)
@@ -562,7 +577,9 @@ METADATA_RECORD_KEYS = (
 def _metadata_files(root: Path) -> list[Path]:
     canonical_root = root.resolve(strict=False)
     metadata_files: set[Path] = set()
-    for path in canonical_root.rglob("*.json"):
+    for path in canonical_root.rglob("*"):
+        if path.suffix.casefold() != ".json":
+            continue
         if re.fullmatch(
             r"(?:content_list(?:_v2)?|.+_content_list(?:_v2)?)\.json",
             path.name,
@@ -1177,6 +1194,25 @@ def _reference_sort_key(
     )
 
 
+def _document_slug_for_record(root: Path, record: AssetRecord) -> str:
+    documents = {
+        reference.markdown_path.relative_to(root).as_posix().casefold()
+        for reference in record.references
+    }
+    if len(documents) > 1:
+        return "shared"
+    reference = min(
+        record.references,
+        key=lambda item: (
+            item.markdown_path.relative_to(root).as_posix().casefold(),
+            item.start,
+            item.end,
+        ),
+    )
+    document_path = reference.markdown_path.relative_to(root)
+    return slugify(document_path.with_suffix("").as_posix()) or "document"
+
+
 def propose_names(
     root: Path,
     assets: dict[Path, AssetRecord],
@@ -1217,28 +1253,17 @@ def propose_names(
             number = explicit_number
             next_numbers[prefix] = max(next_numbers[prefix], number + 1)
 
-        reference = min(
-            record.references,
-            key=lambda item: (
-                item.markdown_path.relative_to(canonical_root)
-                .as_posix()
-                .casefold(),
-                item.start,
-                item.end,
-            ),
-        )
-        document_path = reference.markdown_path.relative_to(canonical_root)
-        document_slug = slugify(document_path.with_suffix("").as_posix())
+        document_slug = _document_slug_for_record(canonical_root, record)
         semantic_slug = slugify(semantic_text) or "asset"
         stem = "{}-{}{:02d}-{}".format(
-            document_slug or "document",
+            document_slug,
             prefix,
             number,
             semantic_slug,
         )
         hash8 = record.sha256[:8]
-        candidate = safe_filename(
-            stem, record.path.suffix, hash8
+        candidate = _safe_filename_with_hashes(
+            stem, record.path.suffix, [hash8]
         )
         collision_index = 0
         relative_asset = record.path.relative_to(canonical_root).as_posix()
@@ -1258,8 +1283,8 @@ def propose_names(
                     record.sha256, relative_asset, collision_index
                 ).encode("utf-8")
             ).hexdigest()[:8]
-            candidate = safe_filename(
-                stem, record.path.suffix, collision_hash
+            candidate = _safe_filename_with_hashes(
+                stem, record.path.suffix, [hash8, collision_hash]
             )
             candidate_target = (directory_key, candidate.casefold())
         used_targets.add(candidate_target)
