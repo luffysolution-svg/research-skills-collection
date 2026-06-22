@@ -1078,14 +1078,15 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
         self,
     ):
         root = Path("C:/workspace").resolve(strict=False)
-        metadata = root / "content_list.json"
         alias = root / "alias_content_list.json"
+        second_alias = root / "second_content_list_v2.json"
+        metadata = root / "data.json"
         outside_link = root / "outside_content_list.json"
-        outside = Path("C:/outside/content_list.json").resolve(strict=False)
+        outside = Path("C:/outside/data.json").resolve(strict=False)
         real_resolve = Path.resolve
 
         def resolve_candidates(path, strict=False):
-            if path == alias:
+            if path in (alias, second_alias):
                 return metadata
             if path == outside_link:
                 return outside
@@ -1096,7 +1097,7 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
                 Path,
                 "rglob",
                 autospec=True,
-                return_value=[outside_link, alias, metadata],
+                return_value=[outside_link, second_alias, alias],
             ),
             patch.object(Path, "is_file", autospec=True, return_value=True),
             patch.object(

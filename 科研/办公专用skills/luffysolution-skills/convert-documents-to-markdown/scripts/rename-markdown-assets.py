@@ -558,6 +558,12 @@ def _metadata_files(root: Path) -> list[Path]:
     canonical_root = root.resolve(strict=False)
     metadata_files: set[Path] = set()
     for path in canonical_root.rglob("*.json"):
+        if re.fullmatch(
+            r"(?:content_list(?:_v2)?|.+_content_list(?:_v2)?)\.json",
+            path.name,
+            re.IGNORECASE,
+        ) is None:
+            continue
         try:
             canonical_path = path.resolve(strict=False)
         except (OSError, RuntimeError):
@@ -565,12 +571,6 @@ def _metadata_files(root: Path) -> list[Path]:
         if (
             not canonical_path.is_relative_to(canonical_root)
             or not canonical_path.is_file()
-            or re.fullmatch(
-                r"(?:content_list(?:_v2)?|.+_content_list(?:_v2)?)\.json",
-                canonical_path.name,
-                re.IGNORECASE,
-            )
-            is None
         ):
             continue
         metadata_files.add(canonical_path)
