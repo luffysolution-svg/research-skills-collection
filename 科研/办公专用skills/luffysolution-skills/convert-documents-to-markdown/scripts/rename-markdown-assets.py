@@ -651,6 +651,10 @@ def _page_index(record: dict[str, object]) -> int | None:
         return None
     if isinstance(value, int):
         return value if value >= 0 else None
+    if isinstance(value, float):
+        if math.isfinite(value) and value >= 0 and value.is_integer():
+            return int(value)
+        return None
     if isinstance(value, str):
         if re.fullmatch(r"\d+", value):
             return int(value)
@@ -704,6 +708,10 @@ def _valid_metadata_record(record: dict[str, object]) -> bool:
             or not (
                 isinstance(value, int)
                 and value >= 0
+                or isinstance(value, float)
+                and math.isfinite(value)
+                and value >= 0
+                and value.is_integer()
                 or isinstance(value, str)
                 and re.fullmatch(r"\d+", value) is not None
             )

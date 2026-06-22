@@ -1007,7 +1007,10 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             ("type-object", {"visual_type": {"kind": "image"}}),
             ("type-empty", {"sub_type": ""}),
             ("page-negative", {"page_idx": -1}),
-            ("page-float", {"page_index": 4.0}),
+            ("page-negative-float", {"page_index": -1.0}),
+            ("page-fractional-float", {"page_index": 4.5}),
+            ("page-nan", {"page_index": float("nan")}),
+            ("page-infinity", {"page_index": float("inf")}),
             ("page-bool", {"page": True}),
             ("page-spaced-string", {"page_idx": " 4 "}),
             ("page-signed-string", {"page_idx": "+4"}),
@@ -1034,6 +1037,26 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             metadata = rename_markdown_assets.load_mineru_metadata(root)
 
         self.assertEqual(metadata, {})
+
+    def test_metadata_accepts_integral_float_page_value(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image = root / "images" / "valid.png"
+            image.parent.mkdir()
+            image.write_bytes(b"valid")
+            self.write_json(
+                root / "content_list.json",
+                [
+                    {
+                        "img_path": "images/valid.png",
+                        "page_index": 4.0,
+                    }
+                ],
+            )
+
+            metadata = rename_markdown_assets.load_mineru_metadata(root)
+
+        self.assertEqual(metadata[image.resolve()][0]["page_idx"], 4)
 
     def test_metadata_skips_invalid_asset_paths(self):
         with tempfile.TemporaryDirectory() as temp_dir:
