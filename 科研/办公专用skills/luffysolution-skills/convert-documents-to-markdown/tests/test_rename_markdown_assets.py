@@ -2161,6 +2161,320 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             "vision-test-model",
         )
 
+    def test_vision_cache_key_includes_request_context_internally(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            output = workspace / "plan"
+            calls = []
+
+            def make_tree(name):
+                root = workspace / name
+                docs = root / "docs"
+                images = root / "images"
+                docs.mkdir(parents=True)
+                images.mkdir()
+                asset = images / "shared.png"
+                asset.write_bytes(b"same-bytes")
+                (docs / f"{name}.md").write_text(
+                    "![](../images/shared.png)\n",
+                    encoding="utf-8",
+                )
+                return root
+
+            first_root = make_tree("first")
+            second_root = make_tree("second")
+
+            def fake_vision(path, context_data, _config):
+                calls.append(context_data["references"][0]["document"])
+                return {
+                    "description": "context specific schematic",
+                    "keywords": ["context", "schematic"],
+                    "confidence": 0.92,
+                }
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "MARKITDOWN_OCR_API_KEY": "secret-test-key",
+                    "MARKITDOWN_OCR_MODEL": "vision-test-model",
+                },
+            ):
+                first = rename_markdown_assets.create_plan(
+                    first_root,
+                    output,
+                    use_vision=True,
+                    vision_analyzer=fake_vision,
+                )
+                second = rename_markdown_assets.create_plan(
+                    second_root,
+                    output,
+                    use_vision=True,
+                    vision_analyzer=fake_vision,
+                )
+                third = rename_markdown_assets.create_plan(
+                    second_root,
+                    output,
+                    use_vision=True,
+                    vision_analyzer=fake_vision,
+                )
+            cache = json.loads(
+                (output / ".asset-name-cache.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(calls, ["docs/first.md", "docs/second.md"])
+        self.assertEqual(first["summary"]["vision_calls"], 1)
+        self.assertEqual(second["summary"]["vision_calls"], 1)
+        self.assertEqual(third["summary"]["vision_calls"], 0)
+        self.assertEqual(len(cache["entries"]), 2)
+        self.assertNotIn("secret-test-key", json.dumps(cache, sort_keys=True))
+
+    def test_analyze_image_with_vision_sends_bounded_openai_request(self):
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+                self.read_size = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                return False
+
+            def read(self, size=-1):
+                self.read_size = size
+                return self.payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir) / "diagram.png"
+            image.write_bytes(b"png")
+            body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "description": "heat exchanger diagram",
+                                    "keywords": ["heat", "exchanger"],
+                                    "confidence": 0.94,
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+            response = FakeResponse(json.dumps(body).encode("utf-8"))
+            captured = {}
+
+            def fake_urlopen(request, timeout):
+                captured["timeout"] = timeout
+                captured["authorization"] = request.get_header(
+                    "Authorization"
+                )
+                captured["content_type"] = request.get_header("Content-type")
+                captured["payload"] = json.loads(
+                    request.data.decode("utf-8")
+                )
+                return response
+
+            with patch.object(
+                rename_markdown_assets.urllib_request,
+                "urlopen",
+                side_effect=fake_urlopen,
+            ):
+                result = rename_markdown_assets.analyze_image_with_vision(
+                    image,
+                    {"nearby": "context"},
+                    {
+                        "api_key": "secret-test-key",
+                        "base_url": "https://example.test/v1",
+                        "model": "vision-model",
+                    },
+                )
+
+        self.assertEqual(result["description"], "heat exchanger diagram")
+        self.assertEqual(captured["timeout"], 60)
+        self.assertEqual(captured["authorization"], "Bearer secret-test-key")
+        self.assertEqual(captured["content_type"], "application/json")
+        self.assertEqual(captured["payload"]["model"], "vision-model")
+        self.assertEqual(
+            response.read_size,
+            rename_markdown_assets.MAX_VISION_RESPONSE_BYTES + 1,
+        )
+
+    def test_analyze_image_with_vision_raises_controlled_errors(self):
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                return False
+
+            def read(self, size=-1):
+                return self.payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir) / "diagram.png"
+            image.write_bytes(b"png")
+            config = {
+                "api_key": "secret-test-key",
+                "base_url": "https://example.test/v1",
+                "model": "vision-model",
+            }
+            cases = [
+                b"not-json",
+                json.dumps([]).encode("utf-8"),
+                json.dumps({"choices": []}).encode("utf-8"),
+                json.dumps(
+                    {"choices": [{"message": {"content": "not-json"}}]}
+                ).encode("utf-8"),
+                json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json.dumps(["not-object"])
+                                }
+                            }
+                        ]
+                    }
+                ).encode("utf-8"),
+                b"\xff",
+                b"{" + (
+                    b" " * rename_markdown_assets.MAX_VISION_RESPONSE_BYTES
+                ),
+            ]
+            for payload in cases:
+                with self.subTest(payload=payload[:20]):
+                    with patch.object(
+                        rename_markdown_assets.urllib_request,
+                        "urlopen",
+                        return_value=FakeResponse(payload),
+                    ):
+                        with self.assertRaises(
+                            rename_markdown_assets.VisionAnalysisError
+                        ) as raised:
+                            rename_markdown_assets.analyze_image_with_vision(
+                                image,
+                                {},
+                                config,
+                            )
+                    self.assertNotIn("secret-test-key", str(raised.exception))
+
+            with patch.object(
+                rename_markdown_assets.urllib_request,
+                "urlopen",
+                side_effect=OSError("secret-test-key provider down"),
+            ):
+                with self.assertRaises(
+                    rename_markdown_assets.VisionAnalysisError
+                ) as raised:
+                    rename_markdown_assets.analyze_image_with_vision(
+                        image,
+                        {},
+                        config,
+                    )
+            self.assertNotIn("secret-test-key", str(raised.exception))
+
+    def test_analyze_image_with_vision_rejects_oversized_images(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir) / "too-large.png"
+            image.write_bytes(b"large")
+            with patch.object(
+                rename_markdown_assets,
+                "MAX_VISION_IMAGE_BYTES",
+                4,
+            ):
+                with self.assertRaises(
+                    rename_markdown_assets.VisionAnalysisError
+                ):
+                    rename_markdown_assets.analyze_image_with_vision(
+                        image,
+                        {},
+                        {
+                            "api_key": "secret-test-key",
+                            "base_url": "https://example.test/v1",
+                            "model": "vision-model",
+                        },
+                    )
+
+    def test_vision_failures_do_not_write_api_key_to_plan_or_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, _markdown_path = self.make_markdown_tree(
+                temp_dir,
+                "![](images/a.png)\n",
+            )
+            (images / "a.png").write_bytes(b"generic")
+            output = root / "plan"
+
+            def fake_vision(_path, _context, _config):
+                raise rename_markdown_assets.VisionAnalysisError(
+                    "secret-test-key provider unavailable"
+                )
+
+            with patch.dict(
+                "os.environ",
+                {"MARKITDOWN_OCR_API_KEY": "secret-test-key"},
+            ):
+                plan = rename_markdown_assets.create_plan(
+                    root,
+                    output,
+                    use_vision=True,
+                    vision_analyzer=fake_vision,
+                )
+            plan_text = (output / "rename-plan.json").read_text(
+                encoding="utf-8"
+            )
+            cache_text = (output / ".asset-name-cache.json").read_text(
+                encoding="utf-8"
+            )
+
+        self.assertEqual(plan["assets"][0]["vision_status"], "failed")
+        self.assertNotIn("secret-test-key", plan_text)
+        self.assertNotIn("secret-test-key", cache_text)
+
+    def test_vision_cache_write_prunes_invalid_nested_entries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir)
+            rename_markdown_assets._write_vision_cache(
+                output,
+                {
+                    "schema": 1,
+                    "entries": {
+                        "valid": {
+                            "prompt_version": "semantic-asset-name-v1",
+                            "model": "vision-model",
+                            "sha256": "a" * 64,
+                            "context_digest": "b" * 64,
+                            "result": {
+                                "description": "valid diagram",
+                                "keywords": ["valid"],
+                                "confidence": 0.9,
+                            },
+                        },
+                        "not-a-dict": "bad",
+                        "bad-result": {
+                            "result": {
+                                "description": "",
+                                "keywords": [],
+                                "confidence": 0.9,
+                            }
+                        },
+                    },
+                },
+            )
+            cache = json.loads(
+                (output / ".asset-name-cache.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(list(cache["entries"]), ["valid"])
+
     def test_create_plan_without_vision_does_not_load_vision_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root, images, _markdown_path = self.make_markdown_tree(

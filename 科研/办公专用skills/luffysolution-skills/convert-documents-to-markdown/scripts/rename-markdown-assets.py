@@ -61,6 +61,12 @@ DEFAULT_VISION_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_VISION_MODEL = "gpt-4.1-mini"
 VISION_CONFIDENCE_THRESHOLD = 0.65
 CACHE_FILENAME = ".asset-name-cache.json"
+MAX_VISION_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_VISION_RESPONSE_BYTES = 1024 * 1024
+
+
+class VisionAnalysisError(RuntimeError):
+    """Controlled error for optional vision analysis failures."""
 
 
 WINDOWS_RESERVED = {
@@ -137,12 +143,48 @@ def vision_cache_key(
     sha256: str,
     model: str,
     prompt_version: str,
+    context_digest: Optional[str] = None,
 ) -> str:
-    return "sha256={};model={};prompt={}".format(
+    key = "sha256={};model={};prompt={}".format(
         sha256,
         model,
         prompt_version,
     )
+    if context_digest:
+        key = "{};context={}".format(key, context_digest)
+    return key
+
+
+def _stable_json_digest(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _sanitize_vision_cache_entries(entries: object) -> dict[str, object]:
+    if not isinstance(entries, dict):
+        return {}
+    sanitized = {}
+    for key, entry in entries.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        result = entry.get("result")
+        try:
+            validated = _validate_vision_result(result)
+        except VisionAnalysisError:
+            continue
+        sanitized[key] = {
+            "context_digest": str(entry.get("context_digest", "")),
+            "model": str(entry.get("model", "")),
+            "prompt_version": str(entry.get("prompt_version", "")),
+            "result": validated,
+            "sha256": str(entry.get("sha256", "")),
+        }
+    return sanitized
 
 
 def _load_vision_cache(output_dir: Path) -> dict[str, object]:
@@ -153,17 +195,16 @@ def _load_vision_cache(output_dir: Path) -> dict[str, object]:
         return {"schema": 1, "entries": {}}
     if not isinstance(cache, dict):
         return {"schema": 1, "entries": {}}
-    entries = cache.get("entries")
-    if not isinstance(entries, dict):
-        cache["entries"] = {}
-    cache["schema"] = 1
-    return cache
+    return {
+        "schema": 1,
+        "entries": _sanitize_vision_cache_entries(cache.get("entries")),
+    }
 
 
 def _write_vision_cache(output_dir: Path, cache: dict[str, object]) -> None:
     sanitized = {
         "schema": 1,
-        "entries": cache.get("entries", {}),
+        "entries": _sanitize_vision_cache_entries(cache.get("entries")),
     }
     cache_path = output_dir / CACHE_FILENAME
     with cache_path.open("w", encoding="utf-8", newline="\n") as stream:
@@ -180,48 +221,62 @@ def _write_vision_cache(output_dir: Path, cache: dict[str, object]) -> None:
 
 def _image_data_url(path: Path) -> str:
     media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    try:
+        size = path.stat().st_size
+    except OSError:
+        raise VisionAnalysisError("unable to inspect image") from None
+    if size > MAX_VISION_IMAGE_BYTES:
+        raise VisionAnalysisError("image exceeds vision size limit")
+    try:
+        data = path.read_bytes()
+    except OSError:
+        raise VisionAnalysisError("unable to read image") from None
+    if len(data) > MAX_VISION_IMAGE_BYTES:
+        raise VisionAnalysisError("image exceeds vision size limit")
+    encoded = base64.b64encode(data).decode("ascii")
     return "data:{};base64,{}".format(media_type, encoded)
 
 
 def _json_response_content(response: dict[str, object]) -> object:
+    if not isinstance(response, dict):
+        raise VisionAnalysisError("vision response is not an object")
     choices = response.get("choices")
     if not isinstance(choices, list) or not choices:
-        raise ValueError("vision response missing choices")
+        raise VisionAnalysisError("vision response missing choices")
     first = choices[0]
     if not isinstance(first, dict):
-        raise ValueError("vision response choice is not an object")
+        raise VisionAnalysisError("vision response choice is not an object")
     message = first.get("message")
     if not isinstance(message, dict):
-        raise ValueError("vision response missing message")
+        raise VisionAnalysisError("vision response missing message")
     if "parsed" in message:
         return message["parsed"]
     content = message.get("content")
     if not isinstance(content, str):
-        raise ValueError("vision response content is not text")
+        raise VisionAnalysisError("vision response content is not text")
     try:
         return json.loads(content)
     except json.JSONDecodeError as exc:
-        raise ValueError("vision response content is not JSON") from exc
+        raise VisionAnalysisError("vision response content is not JSON") from exc
 
 
 def _validate_vision_result(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
-        raise ValueError("vision result is not an object")
+        raise VisionAnalysisError("vision result is not an object")
     description = value.get("description")
     keywords = value.get("keywords", [])
     confidence = value.get("confidence")
     if not isinstance(description, str) or not description.strip():
-        raise ValueError("vision result missing description")
+        raise VisionAnalysisError("vision result missing description")
     if not isinstance(keywords, list):
-        raise ValueError("vision result keywords must be a list")
+        raise VisionAnalysisError("vision result keywords must be a list")
     cleaned_keywords = [
         str(keyword).strip()
         for keyword in keywords
         if str(keyword).strip()
     ]
     if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
-        raise ValueError("vision result confidence must be numeric")
+        raise VisionAnalysisError("vision result confidence must be numeric")
     return {
         "description": re.sub(r"\s+", " ", description).strip(),
         "keywords": cleaned_keywords,
@@ -236,61 +291,75 @@ def analyze_image_with_vision(
 ) -> dict[str, object]:
     api_key = str(config.get("api_key") or "")
     if not api_key:
-        raise RuntimeError("MARKITDOWN_OCR_API_KEY is not configured")
+        raise VisionAnalysisError("MARKITDOWN_OCR_API_KEY is not configured")
     base_url = str(config.get("base_url") or DEFAULT_VISION_BASE_URL).rstrip("/")
     model = str(config.get("model") or DEFAULT_VISION_MODEL)
     endpoint = "{}/chat/completions".format(base_url)
-    payload = {
-        "model": model,
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Describe the supplied Markdown image for a stable, "
-                    "semantic file name. Return only JSON with description, "
-                    "keywords, and confidence."
-                ),
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": json.dumps(
-                            {
-                                "prompt_version": PROMPT_VERSION,
-                                "context": context,
-                            },
-                            ensure_ascii=False,
-                            sort_keys=True,
-                        ),
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": _image_data_url(path),
+    try:
+        payload = {
+            "model": model,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Describe the supplied Markdown image for a stable, "
+                        "semantic file name. Return only JSON with "
+                        "description, keywords, and confidence."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {
+                                    "prompt_version": PROMPT_VERSION,
+                                    "context": context,
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
                         },
-                    },
-                ],
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": _image_data_url(path),
+                            },
+                        },
+                    ],
+                },
+            ],
+        }
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        http_request = urllib_request.Request(
+            endpoint,
+            data=body,
+            headers={
+                "Authorization": "Bearer {}".format(api_key),
+                "Content-Type": "application/json",
             },
-        ],
-    }
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    http_request = urllib_request.Request(
-        endpoint,
-        data=body,
-        headers={
-            "Authorization": "Bearer {}".format(api_key),
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    with urllib_request.urlopen(http_request, timeout=60) as response:
-        raw_response = response.read().decode("utf-8")
-    parsed_response = json.loads(raw_response)
-    return _validate_vision_result(_json_response_content(parsed_response))
+            method="POST",
+        )
+        with urllib_request.urlopen(http_request, timeout=60) as response:
+            raw_bytes = response.read(MAX_VISION_RESPONSE_BYTES + 1)
+        if len(raw_bytes) > MAX_VISION_RESPONSE_BYTES:
+            raise VisionAnalysisError("vision response exceeds size limit")
+        raw_response = raw_bytes.decode("utf-8")
+        parsed_response = json.loads(raw_response)
+        return _validate_vision_result(
+            _json_response_content(parsed_response)
+        )
+    except VisionAnalysisError:
+        raise
+    except UnicodeDecodeError:
+        raise VisionAnalysisError("vision response is not utf-8") from None
+    except json.JSONDecodeError:
+        raise VisionAnalysisError("vision response is not JSON") from None
+    except Exception:
+        raise VisionAnalysisError("vision request failed") from None
 
 
 def slugify(value: str) -> str:
@@ -1614,17 +1683,20 @@ def _apply_optional_vision(
         )
         if reason != "generic-fallback":
             continue
+        context = _vision_context(record, root)
+        context_digest = _stable_json_digest(context)
         key = vision_cache_key(
             record.sha256,
             str(config["model"]),
             PROMPT_VERSION,
+            context_digest,
         )
         cached = entries.get(key)
         if isinstance(cached, dict):
             result = cached.get("result")
             try:
                 validated = _validate_vision_result(result)
-            except ValueError:
+            except VisionAnalysisError:
                 validated = None
             if validated is not None:
                 status = _vision_status_for_result(validated)
@@ -1641,7 +1713,7 @@ def _apply_optional_vision(
         try:
             vision_calls += 1
             result = _validate_vision_result(
-                analyzer(record.path, _vision_context(record, root), config)
+                analyzer(record.path, context, config)
             )
         except Exception:
             status_by_path[record.path] = "failed"
@@ -1652,6 +1724,7 @@ def _apply_optional_vision(
             "prompt_version": PROMPT_VERSION,
             "model": config["model"],
             "sha256": record.sha256,
+            "context_digest": context_digest,
             "result": result,
         }
         if status == "used":
