@@ -1505,6 +1505,305 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
         )
         hash_file.assert_called_once_with(shared.resolve())
 
+    def test_markdown_context_uses_byte_offsets_and_stable_fallback_order(self):
+        markdown = (
+            "# Reactor Results\n\n"
+            "The experiment reached steady state after ten minutes.\n\n"
+            "前缀文字\n"
+            "![Outlet temperature](images/reactor.png)\n"
+            "Figure 7. Temperature profile near the outlet.\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "reactor.png").write_bytes(b"reactor")
+            reference = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )[0]
+
+            context = rename_markdown_assets.markdown_context(reference)
+            record = rename_markdown_assets.AssetRecord(
+                path=reference.asset_path,
+                sha256="a" * 64,
+                references=[reference],
+                evidence=[],
+            )
+            selected = rename_markdown_assets.choose_evidence(record, {})
+
+        self.assertEqual(context["alt_text"], "Outlet temperature")
+        self.assertEqual(
+            context["nearby_caption"],
+            "Figure 7. Temperature profile near the outlet.",
+        )
+        self.assertEqual(context["nearest_heading"], "Reactor Results")
+        self.assertEqual(
+            context["nearby_paragraph"],
+            "The experiment reached steady state after ten minutes.",
+        )
+        self.assertEqual(
+            selected,
+            ("figure", "Outlet temperature", "markdown-alt"),
+        )
+
+    def test_choose_evidence_prefers_mineru_caption_without_vision(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir,
+                "![generic](images/reactor.png)\n",
+            )
+            asset = images / "reactor.png"
+            asset.write_bytes(b"reactor")
+            reference = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )[0]
+            evidence = {
+                "path": str(asset.resolve()),
+                "caption": "Figure 1. Temperature profile of the first reactor.",
+                "visual_type": "image",
+                "page_idx": 0,
+                "bbox": [0, 0, 1, 1],
+                "source": "content_list",
+            }
+            record = rename_markdown_assets.AssetRecord(
+                path=asset.resolve(),
+                sha256=rename_markdown_assets.sha256_file(asset),
+                references=[reference],
+                evidence=[evidence],
+            )
+
+            rename_markdown_assets.propose_names(
+                root,
+                {asset.resolve(): record},
+                {asset.resolve(): [evidence]},
+            )
+
+        self.assertIn(
+            "fig01-first-reactor-temperature-profile",
+            record.proposed_name,
+        )
+        self.assertEqual(record.reason, "mineru-caption")
+
+    def test_markdown_context_falls_back_from_alt_to_caption_heading_paragraph(
+        self,
+    ):
+        cases = [
+            (
+                "# Heading\n\nContext paragraph.\n\n"
+                "![](images/a.png)\nFigure 2. Caption text.\n",
+                ("figure", "Figure 2. Caption text.", "markdown-caption"),
+            ),
+            (
+                "# Heading\n\n![](images/a.png)\n",
+                ("figure", "Heading", "markdown-heading"),
+            ),
+            (
+                "Context paragraph.\n\n![](images/a.png)\n",
+                ("figure", "Context paragraph.", "markdown-paragraph"),
+            ),
+            (
+                "![](images/a.png)\n",
+                ("figure", "asset", "generic-fallback"),
+            ),
+        ]
+        for markdown, expected in cases:
+            with self.subTest(expected=expected):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root, images, markdown_path = self.make_markdown_tree(
+                        temp_dir, markdown
+                    )
+                    asset = images / "a.png"
+                    asset.write_bytes(b"a")
+                    reference = rename_markdown_assets.scan_markdown(
+                        markdown_path, root
+                    )[0]
+                    record = rename_markdown_assets.AssetRecord(
+                        path=asset.resolve(),
+                        sha256="b" * 64,
+                        references=[reference],
+                        evidence=[],
+                    )
+
+                    selected = rename_markdown_assets.choose_evidence(
+                        record, {}
+                    )
+
+                self.assertEqual(selected, expected)
+
+    def test_markdown_context_extracts_reference_style_alt_text(self):
+        markdown = (
+            "# Results\n\n"
+            "![Reference reactor profile][reactor]\n\n"
+            "[reactor]: images/reactor.png\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "reactor.png").write_bytes(b"reactor")
+            reference = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )[0]
+
+            context = rename_markdown_assets.markdown_context(reference)
+
+        self.assertEqual(
+            context["alt_text"],
+            "Reference reactor profile",
+        )
+
+    def test_propose_names_is_stable_shared_and_collision_safe(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            docs = root / "docs"
+            images = root / "images"
+            docs.mkdir()
+            images.mkdir()
+            first = images / "one.PNG"
+            second = images / "two.png"
+            first.write_bytes(b"one")
+            second.write_bytes(b"two")
+            (docs / "a.md").write_text(
+                "![Pressure curve](../images/one.PNG)\n"
+                "![Pressure curve](../images/two.png)\n",
+                encoding="utf-8",
+            )
+            (docs / "b.md").write_text(
+                "![shared](../images/one.PNG)\n",
+                encoding="utf-8",
+            )
+            _documents, assets, _warnings = (
+                rename_markdown_assets.build_asset_graph(root)
+            )
+
+            first_result = rename_markdown_assets.propose_names(
+                root, assets, {}
+            )
+            first_names = [
+                record.proposed_name for record in first_result.values()
+            ]
+            second_result = rename_markdown_assets.propose_names(
+                root, assets, {}
+            )
+
+        self.assertEqual(list(first_result), sorted(first_result))
+        self.assertEqual(len(first_result[first.resolve()].references), 2)
+        self.assertEqual(
+            first_names,
+            [record.proposed_name for record in second_result.values()],
+        )
+        self.assertEqual(
+            len({name.casefold() for name in first_names}),
+            len(first_names),
+        )
+        self.assertTrue(all("-" + record.sha256[:8] in record.proposed_name
+                            for record in first_result.values()))
+
+    def test_propose_names_avoids_existing_case_insensitive_target(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            docs = root / "docs"
+            images = root / "images"
+            docs.mkdir()
+            images.mkdir()
+            asset = images / "source.png"
+            asset.write_bytes(b"source")
+            digest = rename_markdown_assets.sha256_file(asset)
+            expected = rename_markdown_assets.safe_filename(
+                "docs-report-fig01-pressure-curve",
+                ".png",
+                digest[:8],
+            )
+            blocker = images / expected.upper()
+            blocker.write_bytes(b"blocker")
+            (docs / "report.md").write_text(
+                "![Figure 1. Pressure curve](../images/source.png)\n",
+                encoding="utf-8",
+            )
+            _documents, assets, _warnings = (
+                rename_markdown_assets.build_asset_graph(root)
+            )
+
+            result = rename_markdown_assets.propose_names(
+                root, assets, {}
+            )
+
+        self.assertNotEqual(
+            result[asset.resolve()].proposed_name.casefold(),
+            blocker.name.casefold(),
+        )
+
+    def test_create_plan_is_read_only_deterministic_and_has_stable_schema(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            docs = root / "docs"
+            images = root / "images"
+            output = root / "plan"
+            docs.mkdir()
+            images.mkdir()
+            asset = images / "reactor.png"
+            asset.write_bytes(b"reactor")
+            unused = images / "unused.png"
+            unused.write_bytes(b"unused")
+            markdown = docs / "report.md"
+            markdown.write_text(
+                "# Results\n\n"
+                "![Outlet temperature](../images/reactor.png)\n",
+                encoding="utf-8",
+            )
+            before = {
+                path.relative_to(root).as_posix(): path.read_bytes()
+                for path in (asset, unused, markdown)
+            }
+
+            first = rename_markdown_assets.create_plan(root, output)
+            first_json = (output / "rename-plan.json").read_bytes()
+            first_csv = (output / "rename-plan.csv").read_bytes()
+            second = rename_markdown_assets.create_plan(root, output)
+            second_json = (output / "rename-plan.json").read_bytes()
+            second_csv = (output / "rename-plan.csv").read_bytes()
+            after = {
+                path.relative_to(root).as_posix(): path.read_bytes()
+                for path in (asset, unused, markdown)
+            }
+
+        self.assertEqual(before, after)
+        self.assertEqual(first, second)
+        self.assertEqual(first_json, second_json)
+        self.assertEqual(first_csv, second_csv)
+        self.assertTrue(first_csv.startswith(b"\xef\xbb\xbf"))
+        self.assertEqual(first["schema"], 1)
+        self.assertNotIn("timestamp", first)
+        self.assertEqual(len(first["assets"]), 1)
+        entry = first["assets"][0]
+        self.assertTrue(
+            {
+                "old_path",
+                "new_path",
+                "sha256",
+                "reason",
+                "references",
+                "vision_status",
+            }.issubset(entry)
+        )
+        self.assertEqual(entry["old_path"], "images/reactor.png")
+        self.assertEqual(entry["vision_status"], "not-needed")
+        self.assertTrue(all("\\" not in entry[key]
+                            for key in ("old_path", "new_path")))
+        self.assertEqual(
+            first["summary"],
+            {
+                "documents": 1,
+                "unique_references": 1,
+                "eligible_assets": 1,
+                "missing_assets": 0,
+                "unreferenced_assets": 1,
+                "vision_needed_assets": 0,
+                "vision_calls": 0,
+                "warnings": 1,
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

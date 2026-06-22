@@ -1,4 +1,5 @@
 import argparse
+import csv
 import hashlib
 import html
 import json
@@ -924,6 +925,505 @@ def build_asset_graph(
         for path in sorted(unreferenced_paths)
     )
     return documents, assets, warnings
+
+
+CAPTION_LABEL_PATTERN = re.compile(
+    r"^\s*(?P<label>"
+    r"figure|fig\.?|图|table|表|chart"
+    r")\s*(?P<number>\d+)?\s*[\.:：、-]?\s*",
+    re.IGNORECASE,
+)
+
+
+def _clean_markdown_text(value: str) -> str:
+    value = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", value)
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = re.sub(r"[`*_~]+", "", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _reference_character_offset(encoded: bytes, byte_offset: int) -> int:
+    bounded_offset = min(max(byte_offset, 0), len(encoded))
+    return len(encoded[:bounded_offset].decode("utf-8"))
+
+
+def _reference_alt_text(
+    text: str, character_offset: int, syntax: str
+) -> str:
+    line_start = text.rfind("\n", 0, character_offset) + 1
+    line_end = text.find("\n", character_offset)
+    if line_end == -1:
+        line_end = len(text)
+    line = text[line_start:line_end]
+    relative_offset = character_offset - line_start
+    prefix = line[:relative_offset]
+
+    markdown_match = re.search(
+        r"!\[(?P<alt>(?:\\.|[^\]])*)\]\(\s*<?[^<>()]*$",
+        prefix,
+    )
+    if markdown_match is not None:
+        return _clean_markdown_text(
+            re.sub(r"\\(.)", r"\1", markdown_match.group("alt"))
+        )
+
+    if syntax == "markdown-reference":
+        definition = re.match(
+            r"[ \t]*\[([^\]]+)\][ \t]*:[ \t]*<?",
+            line,
+        )
+        if definition is not None:
+            label = _reference_label(definition.group(1))
+            for match in re.finditer(
+                r"!\[(?P<alt>(?:\\.|[^\]])*)\]"
+                r"(?:\[(?P<label>(?:\\.|[^\]])*)\])?",
+                text,
+            ):
+                alt = re.sub(r"\\(.)", r"\1", match.group("alt"))
+                raw_label = match.group("label")
+                candidate_label = alt if raw_label in (None, "") else raw_label
+                if _reference_label(candidate_label) == label:
+                    return _clean_markdown_text(alt)
+
+    tag_start = line.rfind("<", 0, relative_offset)
+    tag_end = line.find(">", relative_offset)
+    if tag_start != -1 and tag_end != -1:
+        tag = line[tag_start : tag_end + 1]
+        if re.match(r"<img\b", tag, re.IGNORECASE):
+            alt_match = re.search(
+                r"""(?<!\S)alt\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""",
+                tag,
+                re.IGNORECASE,
+            )
+            if alt_match is not None:
+                return _clean_markdown_text(
+                    next(
+                        value
+                        for value in alt_match.groups()
+                        if value is not None
+                    )
+                )
+    return ""
+
+
+def _paragraph_blocks(text: str) -> list[tuple[int, int, str]]:
+    blocks = []
+    for match in re.finditer(r"(?ms)(?:^|\n[ \t]*\n)([^\n].*?)(?=\n[ \t]*\n|\Z)", text):
+        raw = match.group(1).strip()
+        cleaned = _clean_markdown_text(raw)
+        if cleaned:
+            blocks.append((match.start(1), match.end(1), cleaned))
+    return blocks
+
+
+def markdown_context(reference: Reference) -> dict[str, str]:
+    encoded = reference.markdown_path.read_bytes()
+    text = encoded.decode("utf-8")
+    character_offset = _reference_character_offset(encoded, reference.start)
+    alt_text = _reference_alt_text(
+        text, character_offset, reference.syntax
+    )
+
+    captions = []
+    for match in re.finditer(r"(?m)^[ \t]*(?:Figure|Fig\.?|图|Table|表|Chart)\s*\d*"
+                             r"\s*[\.:：、-]?\s*\S.*$", text, re.IGNORECASE):
+        distance = min(
+            abs(match.start() - character_offset),
+            abs(match.end() - character_offset),
+        )
+        if distance <= 500:
+            captions.append((distance, match.start(), _clean_markdown_text(match.group())))
+    nearby_caption = min(captions)[2] if captions else ""
+
+    headings = [
+        (match.start(), _clean_markdown_text(match.group(1)))
+        for match in re.finditer(
+            r"(?m)^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$",
+            text[:character_offset],
+        )
+        if _clean_markdown_text(match.group(1))
+    ]
+    nearest_heading = headings[-1][1] if headings else ""
+
+    before = []
+    after = []
+    for start, end, paragraph in _paragraph_blocks(text):
+        if (
+            paragraph.startswith("#")
+            or CAPTION_LABEL_PATTERN.match(paragraph)
+            or start <= character_offset <= end
+            or re.search(r"!\[[^\]]*\]\([^)]*\)|<img\b", text[start:end],
+                         re.IGNORECASE)
+        ):
+            continue
+        if end < character_offset:
+            before.append((end, paragraph))
+        elif start > character_offset:
+            after.append((start, paragraph))
+    if before:
+        nearby_paragraph = before[-1][1]
+    elif after:
+        nearby_paragraph = after[0][1]
+    else:
+        nearby_paragraph = ""
+
+    return {
+        "alt_text": alt_text,
+        "nearby_caption": nearby_caption,
+        "nearest_heading": nearest_heading,
+        "nearby_paragraph": nearby_paragraph,
+    }
+
+
+def _normalized_visual_type(value: str, semantic_text: str) -> str:
+    label = CAPTION_LABEL_PATTERN.match(semantic_text)
+    if label is not None:
+        label_text = label.group("label").casefold().rstrip(".")
+        if label_text in {"table", "表"}:
+            return "table"
+        if label_text == "chart":
+            return "chart"
+        return "figure"
+    normalized = value.casefold()
+    if "table" in normalized or normalized == "表":
+        return "table"
+    if "chart" in normalized or "plot" in normalized or "graph" in normalized:
+        return "chart"
+    return "figure"
+
+
+def choose_evidence(
+    record: AssetRecord,
+    metadata: dict[Path, list[dict[str, object]]],
+) -> tuple[str, str, str]:
+    evidence = list(record.evidence)
+    if not evidence:
+        evidence = list(metadata.get(record.path, []))
+    for item in evidence:
+        caption = item.get("caption", "")
+        if isinstance(caption, str) and caption.strip():
+            caption = re.sub(r"\s+", " ", caption).strip()
+            visual_type = _normalized_visual_type(
+                str(item.get("visual_type", "image")), caption
+            )
+            return visual_type, caption, "mineru-caption"
+
+    contexts = [
+        markdown_context(reference)
+        for reference in sorted(
+            record.references,
+            key=lambda item: (
+                item.markdown_path.as_posix().casefold(),
+                item.start,
+                item.end,
+            ),
+        )
+    ]
+    fields = (
+        ("alt_text", "markdown-alt"),
+        ("nearby_caption", "markdown-caption"),
+        ("nearest_heading", "markdown-heading"),
+        ("nearby_paragraph", "markdown-paragraph"),
+    )
+    for field, reason in fields:
+        for context in contexts:
+            value = context[field]
+            if value:
+                return _normalized_visual_type("image", value), value, reason
+    return "figure", "asset", "generic-fallback"
+
+
+def _caption_parts(
+    visual_type: str, semantic_text: str
+) -> tuple[str, Optional[int], str]:
+    match = CAPTION_LABEL_PATTERN.match(semantic_text)
+    number = None
+    if match is not None:
+        number_text = match.group("number")
+        number = int(number_text) if number_text else None
+        semantic_text = semantic_text[match.end() :]
+    prefix = {
+        "table": "table",
+        "chart": "chart",
+    }.get(visual_type, "fig")
+    semantic_text = semantic_text.strip(" \t\r\n.:：、-")
+    relation = re.fullmatch(
+        r"(.+?)\s+of\s+(?:the\s+)?(.+?)[.!?]?",
+        semantic_text,
+        re.IGNORECASE,
+    )
+    if relation is not None:
+        semantic_text = "{} {}".format(
+            relation.group(2), relation.group(1)
+        )
+    return prefix, number, semantic_text or "asset"
+
+
+def _reference_sort_key(
+    root: Path, record: AssetRecord
+) -> tuple[str, int, str]:
+    reference = min(
+        record.references,
+        key=lambda item: (
+            item.markdown_path.relative_to(root).as_posix().casefold(),
+            item.start,
+            item.end,
+        ),
+    )
+    return (
+        reference.markdown_path.relative_to(root).as_posix().casefold(),
+        reference.start,
+        record.path.relative_to(root).as_posix().casefold(),
+    )
+
+
+def propose_names(
+    root: Path,
+    assets: dict[Path, AssetRecord],
+    metadata: dict[Path, list[dict[str, object]]],
+) -> dict[Path, AssetRecord]:
+    canonical_root = root.resolve(strict=False)
+    ordered_records = sorted(
+        assets.values(),
+        key=lambda record: _reference_sort_key(canonical_root, record),
+    )
+    next_numbers = {"fig": 1, "table": 1, "chart": 1}
+    used_targets: set[tuple[str, str]] = set()
+    existing_targets: set[tuple[str, str]] = set()
+    for directory in {record.path.parent for record in ordered_records}:
+        try:
+            children = directory.iterdir()
+            for child in children:
+                if child.is_file():
+                    existing_targets.add(
+                        (
+                            str(directory).casefold(),
+                            child.name.casefold(),
+                        )
+                    )
+        except OSError:
+            continue
+    result: dict[Path, AssetRecord] = {}
+
+    for record in ordered_records:
+        visual_type, semantic_text, reason = choose_evidence(record, metadata)
+        prefix, explicit_number, semantic_text = _caption_parts(
+            visual_type, semantic_text
+        )
+        if explicit_number is None:
+            number = next_numbers[prefix]
+            next_numbers[prefix] += 1
+        else:
+            number = explicit_number
+            next_numbers[prefix] = max(next_numbers[prefix], number + 1)
+
+        reference = min(
+            record.references,
+            key=lambda item: (
+                item.markdown_path.relative_to(canonical_root)
+                .as_posix()
+                .casefold(),
+                item.start,
+                item.end,
+            ),
+        )
+        document_path = reference.markdown_path.relative_to(canonical_root)
+        document_slug = slugify(document_path.with_suffix("").as_posix())
+        semantic_slug = slugify(semantic_text) or "asset"
+        stem = "{}-{}{:02d}-{}".format(
+            document_slug or "document",
+            prefix,
+            number,
+            semantic_slug,
+        )
+        hash8 = record.sha256[:8]
+        candidate = safe_filename(
+            stem, record.path.suffix, hash8
+        )
+        collision_index = 0
+        relative_asset = record.path.relative_to(canonical_root).as_posix()
+        directory_key = str(record.path.parent).casefold()
+        current_target = (directory_key, record.path.name.casefold())
+        candidate_target = (directory_key, candidate.casefold())
+        while (
+            candidate_target in used_targets
+            or (
+                candidate_target in existing_targets
+                and candidate_target != current_target
+            )
+        ):
+            collision_index += 1
+            collision_hash = hashlib.sha256(
+                "{}:{}:{}".format(
+                    record.sha256, relative_asset, collision_index
+                ).encode("utf-8")
+            ).hexdigest()[:8]
+            candidate = safe_filename(
+                stem, record.path.suffix, collision_hash
+            )
+            candidate_target = (directory_key, candidate.casefold())
+        used_targets.add(candidate_target)
+        record.proposed_name = candidate
+        record.reason = reason
+        result[record.path] = record
+
+    return {
+        path: result[path]
+        for path in sorted(result)
+    }
+
+
+def _relative_plan_path(path: Path, root: Path) -> str:
+    return path.resolve(strict=False).relative_to(root).as_posix()
+
+
+def create_plan(
+    root: Path,
+    output_dir: Path,
+    use_vision: bool = False,
+    vision_analyzer=None,
+) -> dict[str, object]:
+    del use_vision, vision_analyzer
+    canonical_root = root.resolve(strict=False)
+    output_dir = output_dir.resolve(strict=False)
+    documents, assets, warnings = build_asset_graph(canonical_root)
+    metadata = load_mineru_metadata(canonical_root)
+    named_assets = propose_names(canonical_root, assets, metadata)
+
+    entries = []
+    for path, record in named_assets.items():
+        old_path = _relative_plan_path(path, canonical_root)
+        new_path = (
+            path.parent / record.proposed_name
+        ).relative_to(canonical_root).as_posix()
+        references = [
+            {
+                "document": _relative_plan_path(
+                    reference.markdown_path, canonical_root
+                ),
+                "start": reference.start,
+                "end": reference.end,
+                "syntax": reference.syntax,
+            }
+            for reference in sorted(
+                record.references,
+                key=lambda item: (
+                    _relative_plan_path(
+                        item.markdown_path, canonical_root
+                    ).casefold(),
+                    item.start,
+                    item.end,
+                ),
+            )
+        ]
+        entries.append(
+            {
+                "old_path": old_path,
+                "new_path": new_path,
+                "sha256": record.sha256,
+                "reason": record.reason,
+                "references": references,
+                "vision_status": (
+                    "needed"
+                    if record.reason == "generic-fallback"
+                    else "not-needed"
+                ),
+            }
+        )
+
+    normalized_warnings = []
+    for warning in warnings:
+        warning_path = Path(warning["path"]).resolve(strict=False)
+        path_text = (
+            warning_path.relative_to(canonical_root).as_posix()
+            if warning_path.is_relative_to(canonical_root)
+            else warning_path.as_posix()
+        )
+        normalized_warnings.append(
+            {"code": warning["code"], "path": path_text}
+        )
+    normalized_warnings.sort(
+        key=lambda item: (item["code"], item["path"].casefold())
+    )
+
+    reference_count = 0
+    for document in documents:
+        reference_count += sum(
+            reference.asset_path.suffix.casefold()
+            in SUPPORTED_IMAGE_EXTENSIONS
+            for reference in scan_markdown(document, canonical_root)
+        )
+    missing_count = sum(
+        warning["code"] == "missing-asset"
+        for warning in normalized_warnings
+    )
+    unreferenced_count = sum(
+        warning["code"] == "unreferenced-asset"
+        for warning in normalized_warnings
+    )
+    vision_needed = sum(
+        entry["vision_status"] == "needed"
+        for entry in entries
+    )
+    plan = {
+        "schema": 1,
+        "assets": entries,
+        "summary": {
+            "documents": len(documents),
+            "unique_references": reference_count,
+            "eligible_assets": len(entries),
+            "missing_assets": missing_count,
+            "unreferenced_assets": unreferenced_count,
+            "vision_needed_assets": vision_needed,
+            "vision_calls": 0,
+            "warnings": len(normalized_warnings),
+        },
+        "warnings": normalized_warnings,
+    }
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / "rename-plan.json"
+    with json_path.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write(
+            json.dumps(
+                plan,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        stream.write("\n")
+
+    csv_path = output_dir / "rename-plan.csv"
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.writer(stream, lineterminator="\n")
+        writer.writerow(
+            (
+                "old_path",
+                "new_path",
+                "sha256",
+                "reason",
+                "vision_status",
+                "references",
+            )
+        )
+        for entry in entries:
+            writer.writerow(
+                (
+                    entry["old_path"],
+                    entry["new_path"],
+                    entry["sha256"],
+                    entry["reason"],
+                    entry["vision_status"],
+                    json.dumps(
+                        entry["references"],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                )
+            )
+    return plan
 
 
 def main(argv=None) -> int:
