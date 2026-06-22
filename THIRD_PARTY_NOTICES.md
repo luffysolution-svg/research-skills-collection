@@ -1,10 +1,13 @@
-# Third-Party Notices
+# Third-Party Notices / 第三方声明
 
-This repository is an aggregation of independently authored Agent Skills.
-Copyright remains with each upstream author. No repository-wide license
-overrides the license of any included skill.
+本文件使用英文维护权威的第三方来源与许可证信息，中文说明用于导航。完整许可证
+副本位于 [`THIRD_PARTY_LICENSES/`](THIRD_PARTY_LICENSES/)。
 
-完整许可证副本位于 [`THIRD_PARTY_LICENSES/`](THIRD_PARTY_LICENSES/)。
+This repository aggregates independently authored Agent Skills. Copyright
+remains with each upstream author. No repository-wide license overrides or
+replaces the license of third-party content.
+
+## Included upstream projects
 
 | Upstream project | License used by included content |
 |---|---|
@@ -25,7 +28,14 @@ overrides the license of any included skill.
 | [K-Dense-AI/scientific-agent-skills](https://github.com/K-Dense-AI/scientific-agent-skills) | MIT, except excluded embedded Anthropic document skills |
 | [Leonxlnx/taste-skill](https://github.com/Leonxlnx/taste-skill) | MIT |
 
-## Excluded content
+## Repository-original content
+
+`科研/办公专用skills/luffysolution-skills/convert-documents-to-markdown/` is
+original content maintained in this repository. It is not governed by the
+upstream license table above. This notice does not itself grant a license to
+repository-original content.
+
+## Intentionally excluded content
 
 The following files are intentionally not redistributed:
 
@@ -37,5 +47,11 @@ The following files are intentionally not redistributed:
   currently does not declare a repository license; users should install it
   from the official Codex marketplace.
 
+## User responsibility
+
+Before using, modifying, or redistributing a skill, review its local license
+files and the applicable upstream terms. License compatibility may depend on
+the intended use, especially for CC BY-NC 4.0 and AGPL-3.0 content.
+
 This notice is informational and is not legal advice. Users are responsible
-for complying with each upstream license.
+for compliance with each upstream license.
