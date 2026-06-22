@@ -1511,6 +1511,22 @@ def _document_slug_for_record(root: Path, record: AssetRecord) -> str:
     return slugify(document_path.with_suffix("").as_posix()) or "document"
 
 
+def _semantic_name_stem(
+    document_slug: str,
+    prefix: str,
+    number: int,
+    semantic_slug: str,
+    stem_limit: int = 100,
+) -> str:
+    semantic_slug = semantic_slug or "asset"
+    semantic_part = "{}{:02d}-{}".format(prefix, number, semantic_slug)
+    available = stem_limit - len(semantic_part) - 1
+    if available < 12:
+        available = 12
+    document_part = document_slug[:available].rstrip("-") or "document"
+    return "{}-{}".format(document_part, semantic_part)
+
+
 def propose_names(
     root: Path,
     assets: dict[Path, AssetRecord],
@@ -1553,7 +1569,7 @@ def propose_names(
 
         document_slug = _document_slug_for_record(canonical_root, record)
         semantic_slug = slugify(semantic_text) or "asset"
-        stem = "{}-{}{:02d}-{}".format(
+        stem = _semantic_name_stem(
             document_slug,
             prefix,
             number,
@@ -2150,8 +2166,6 @@ def preflight_plan(
         assets = []
 
     root = _infer_plan_root(plan, plan_path).resolve(strict=False)
-    if not plan_path.is_relative_to(root):
-        errors.append("plan path is outside inferred root")
 
     executable_assets = []
     target_keys: dict[str, str] = {}
@@ -2380,6 +2394,14 @@ def _asset_temp_path(asset_path: Path, transaction_id: str, index: int) -> Path:
         index,
     )
     return asset_path.with_name(name)
+
+
+def _markdown_backup_path(backup_root: Path, relative_document: Path) -> Path:
+    digest = hashlib.sha256(
+        relative_document.as_posix().encode("utf-8")
+    ).hexdigest()[:16]
+    suffix = relative_document.suffix or ".md"
+    return backup_root / "{}{}".format(digest, suffix)
 
 
 def _start_journal_op(
@@ -2623,7 +2645,7 @@ def apply_plan(plan_path: Path, fail_after=None) -> dict[str, object]:
         ):
             original = document.read_bytes()
             relative_document = document.relative_to(root)
-            backup_path = backup_root / relative_document
+            backup_path = _markdown_backup_path(backup_root, relative_document)
             backup_temp = _atomic_replace_temp_path(backup_path, original)
             op_index = _start_journal_op(
                 journal_path,

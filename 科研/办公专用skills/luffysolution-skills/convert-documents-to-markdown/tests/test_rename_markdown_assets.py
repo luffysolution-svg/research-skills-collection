@@ -1783,6 +1783,35 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             blocker.name.casefold(),
         )
 
+    def test_long_document_slug_does_not_truncate_semantic_caption(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            docs = root / "docs"
+            images = root / "images"
+            docs.mkdir()
+            images.mkdir()
+            asset = images / "source.png"
+            asset.write_bytes(b"source")
+            markdown = docs / (
+                "modeling-of-radial-flow-reactors-of-oxidative-reheat-"
+                "process-for-production-of-styrene-monomer.md"
+            )
+            markdown.write_text(
+                "![](../images/source.png)\n"
+                "Figure 1. Temperature profile of the first reactor.\n",
+                encoding="utf-8",
+            )
+            _documents, assets, _warnings = (
+                rename_markdown_assets.build_asset_graph(root)
+            )
+
+            result = rename_markdown_assets.propose_names(root, assets, {})
+
+        self.assertIn(
+            "fig01-first-reactor-temperature-profile",
+            result[asset.resolve()].proposed_name,
+        )
+
     def test_collision_suffix_preserves_each_asset_content_hash(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
