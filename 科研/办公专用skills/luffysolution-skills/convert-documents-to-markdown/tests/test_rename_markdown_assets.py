@@ -2204,6 +2204,132 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
                 rename_markdown_assets.apply_plan(plan_path)
             self.assertTrue(asset.exists())
 
+    def test_apply_journal_is_write_ahead_before_first_asset_mutation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, _markdown = self.make_markdown_tree(
+                temp_dir,
+                "![plot](images/a.png)\n",
+            )
+            asset = images / "a.png"
+            asset.write_bytes(b"asset")
+            output = root / "plan"
+            rename_markdown_assets.create_plan(root, output)
+            plan_path = output / "rename-plan.json"
+            original_replace = rename_markdown_assets.os.replace
+
+            def fail_first_asset_replace(source, target):
+                source_path = Path(source)
+                target_path = Path(target)
+                if ".rename-" in source_path.name + target_path.name:
+                    raise OSError("crash before first asset mutation")
+                return original_replace(source, target)
+
+            with patch.object(
+                rename_markdown_assets.os,
+                "replace",
+                side_effect=fail_first_asset_replace,
+            ):
+                with self.assertRaises(OSError):
+                    rename_markdown_assets.apply_plan(plan_path)
+
+            journals = list(output.glob(".rename-markdown-assets/*/transaction.json"))
+            self.assertEqual(len(journals), 1)
+            journal = json.loads(journals[0].read_text(encoding="utf-8"))
+            self.assertEqual(journal["operations"][0]["status"], "started")
+            self.assertEqual(journal["operations"][0]["kind"], "asset-old-to-temp")
+            self.assertIn("source", journal["operations"][0])
+            self.assertIn("temp", journal["operations"][0])
+            self.assertTrue(asset.exists())
+
+    def test_apply_journal_records_pending_second_asset_mutation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, _markdown = self.make_markdown_tree(
+                temp_dir,
+                "![plot](images/a.png)\n",
+            )
+            asset = images / "a.png"
+            asset.write_bytes(b"asset")
+            output = root / "plan"
+            rename_markdown_assets.create_plan(root, output)
+            plan_path = output / "rename-plan.json"
+            original_replace = rename_markdown_assets.os.replace
+            asset_replaces = []
+
+            def fail_second_asset_replace(source, target):
+                source_path = Path(source)
+                target_path = Path(target)
+                if ".rename-" in source_path.name + target_path.name:
+                    asset_replaces.append((source_path, target_path))
+                    if len(asset_replaces) == 2:
+                        raise OSError("crash before temp-to-target")
+                return original_replace(source, target)
+
+            with patch.object(
+                rename_markdown_assets.os,
+                "replace",
+                side_effect=fail_second_asset_replace,
+            ):
+                with self.assertRaises(OSError):
+                    rename_markdown_assets.apply_plan(plan_path)
+
+            journal_path = next(
+                output.glob(".rename-markdown-assets/*/transaction.json")
+            )
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            self.assertEqual(journal["operations"][0]["status"], "completed")
+            self.assertEqual(journal["operations"][1]["status"], "started")
+            self.assertEqual(journal["operations"][1]["kind"], "asset-temp-to-target")
+            self.assertIn("source", journal["operations"][1])
+            self.assertIn("target", journal["operations"][1])
+            self.assertTrue(Path(journal["operations"][1]["source"]).exists())
+
+    def test_preflight_rejects_cross_directory_asset_rename(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, _markdown = self.make_markdown_tree(
+                temp_dir,
+                "![plot](images/a.png)\n",
+            )
+            asset = images / "a.png"
+            asset.write_bytes(b"asset")
+            output = root / "plan"
+            plan = rename_markdown_assets.create_plan(root, output)
+            sibling = root / "docs" / "other"
+            sibling.mkdir()
+            plan["assets"][0]["new_path"] = "docs/other/a.png"
+            plan_path = output / "rename-plan.json"
+            self.write_json(plan_path, plan)
+
+            with self.assertRaises(RuntimeError):
+                rename_markdown_assets.apply_plan(plan_path)
+
+            self.assertTrue(asset.exists())
+
+    def test_validate_plan_rejects_extra_rewritten_references(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown = self.make_markdown_tree(
+                temp_dir,
+                "![plot](images/a.png)\n",
+            )
+            asset = images / "a.png"
+            asset.write_bytes(b"asset")
+            output = root / "plan"
+            plan = rename_markdown_assets.create_plan(root, output)
+            entry = plan["assets"][0]
+            plan_path = output / "rename-plan.json"
+            new_destination = (root / entry["new_path"]).relative_to(
+                markdown.parent
+            ).as_posix()
+            rename_markdown_assets.apply_plan(plan_path)
+            with markdown.open("a", encoding="utf-8", newline="") as stream:
+                stream.write("![extra]({})\n".format(new_destination))
+
+            errors = rename_markdown_assets.validate_plan(plan_path)
+
+        self.assertTrue(
+            any("unexpected rewritten references" in error for error in errors),
+            errors,
+        )
+
     def test_create_plan_uses_injected_vision_only_for_generic_assets(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

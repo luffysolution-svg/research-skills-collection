@@ -2151,6 +2151,10 @@ def preflight_plan(
             ))
         old_path_keys.add(old_key)
         listed_references.setdefault(old_key, set())
+        if _path_identity(old_abs.parent) != _path_identity(new_abs.parent):
+            errors.append("asset rename must stay in the same directory: {}".format(
+                entry.get("new_path")
+            ))
         if not old_abs.is_file():
             errors.append("source asset is missing: {}".format(entry.get("old_path")))
         else:
@@ -2293,27 +2297,35 @@ def preflight_plan(
     }
 
 
-def _atomic_replace_bytes(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _atomic_replace_temp_path(path: Path, data: bytes) -> Path:
     digest = hashlib.sha256(data).hexdigest()[:12]
     for index in range(1000):
         temp_path = path.with_name(
             ".{}.tmp-{}-{}".format(path.name, digest, index)
         )
-        try:
-            with temp_path.open("xb") as stream:
-                stream.write(data)
-            os.replace(temp_path, path)
-            return
-        except FileExistsError:
-            continue
-        except Exception:
-            try:
-                temp_path.unlink()
-            except OSError:
-                pass
-            raise
+        if not temp_path.exists():
+            return temp_path
     raise RuntimeError("unable to create temporary file for {}".format(path))
+
+
+def _atomic_replace_bytes(
+    path: Path,
+    data: bytes,
+    temp_path: Optional[Path] = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if temp_path is None:
+        temp_path = _atomic_replace_temp_path(path, data)
+    try:
+        with temp_path.open("xb") as stream:
+            stream.write(data)
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def _atomic_write_json(path: Path, value: dict[str, object]) -> None:
@@ -2335,14 +2347,31 @@ def _asset_temp_path(asset_path: Path, transaction_id: str, index: int) -> Path:
     return asset_path.with_name(name)
 
 
-def _append_journal_op(
+def _start_journal_op(
     journal_path: Path,
     journal: dict[str, object],
     operation: dict[str, object],
+) -> int:
+    operations = journal.setdefault("operations", [])
+    assert isinstance(operations, list)
+    operation = dict(operation)
+    operation["id"] = len(operations) + 1
+    operation["status"] = "started"
+    operations.append(operation)
+    _atomic_write_json(journal_path, journal)
+    return len(operations) - 1
+
+
+def _complete_journal_op(
+    journal_path: Path,
+    journal: dict[str, object],
+    operation_index: int,
 ) -> None:
     operations = journal.setdefault("operations", [])
     assert isinstance(operations, list)
-    operations.append(operation)
+    operation = operations[operation_index]
+    assert isinstance(operation, dict)
+    operation["status"] = "completed"
     _atomic_write_json(journal_path, journal)
 
 
@@ -2384,27 +2413,34 @@ def apply_plan(plan_path: Path, fail_after=None) -> dict[str, object]:
         while temp_path.exists():
             temp_index += len(executable["assets"]) + 1
             temp_path = _asset_temp_path(old_path, transaction_id, temp_index)
-        os.replace(old_path, temp_path)
-        moved_assets.append((temp_path, new_path))
-        _append_journal_op(
+        op_index = _start_journal_op(
             journal_path,
             journal,
             {
+                "kind": "asset-old-to-temp",
                 "op": "move-asset-to-temp",
-                "from": old_path.as_posix(),
-                "to": temp_path.as_posix(),
+                "source": old_path.as_posix(),
+                "target": temp_path.as_posix(),
+                "temp": temp_path.as_posix(),
+            },
+        )
+        os.replace(old_path, temp_path)
+        moved_assets.append((temp_path, new_path))
+        _complete_journal_op(journal_path, journal, op_index)
+        op_index = _start_journal_op(
+            journal_path,
+            journal,
+            {
+                "kind": "asset-temp-to-target",
+                "op": "move-temp-to-target",
+                "source": temp_path.as_posix(),
+                "target": new_path.as_posix(),
+                "temp": temp_path.as_posix(),
+                "old_path": old_path.as_posix(),
             },
         )
         os.replace(temp_path, new_path)
-        _append_journal_op(
-            journal_path,
-            journal,
-            {
-                "op": "move-temp-to-target",
-                "from": temp_path.as_posix(),
-                "to": new_path.as_posix(),
-            },
-        )
+        _complete_journal_op(journal_path, journal, op_index)
 
     replacements_by_document: dict[Path, list[tuple[int, int, bytes]]] = {}
     for asset in executable["assets"]:
@@ -2431,26 +2467,37 @@ def apply_plan(plan_path: Path, fail_after=None) -> dict[str, object]:
         original = document.read_bytes()
         relative_document = document.relative_to(root)
         backup_path = backup_root / relative_document
-        _atomic_replace_bytes(backup_path, original)
-        _append_journal_op(
+        backup_temp = _atomic_replace_temp_path(backup_path, original)
+        op_index = _start_journal_op(
             journal_path,
             journal,
             {
+                "kind": "markdown-backup",
                 "op": "backup-markdown",
-                "path": document.as_posix(),
+                "source": document.as_posix(),
+                "target": backup_path.as_posix(),
                 "backup": backup_path.as_posix(),
+                "temp": backup_temp.as_posix(),
             },
         )
+        _atomic_replace_bytes(backup_path, original, backup_temp)
+        _complete_journal_op(journal_path, journal, op_index)
         rewritten = rewrite_markdown_bytes(original, replacements)
-        _atomic_replace_bytes(document, rewritten)
-        _append_journal_op(
+        markdown_temp = _atomic_replace_temp_path(document, rewritten)
+        op_index = _start_journal_op(
             journal_path,
             journal,
             {
+                "kind": "markdown-replace",
                 "op": "replace-markdown",
-                "path": document.as_posix(),
+                "source": document.as_posix(),
+                "target": document.as_posix(),
+                "backup": backup_path.as_posix(),
+                "temp": markdown_temp.as_posix(),
             },
         )
+        _atomic_replace_bytes(document, rewritten, markdown_temp)
+        _complete_journal_op(journal_path, journal, op_index)
 
     validation_errors = validate_plan(plan_path)
     if validation_errors:
@@ -2552,6 +2599,11 @@ def validate_plan(plan_path: Path) -> list[str]:
         actual = actual_counts.get(key, 0)
         if actual < expected:
             errors.append("missing rewritten references for {} in {}".format(
+                key[1],
+                key[0],
+            ))
+        elif actual > expected:
+            errors.append("unexpected rewritten references for {} in {}".format(
                 key[1],
                 key[0],
             ))
