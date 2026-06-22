@@ -2090,6 +2090,120 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 rename_markdown_assets.preflight_plan(clean_copy, plan_path)
 
+    def test_preflight_requires_valid_reference_source_sha256_before_mutation(self):
+        mutations = [
+            ("missing", lambda reference: reference.pop("source_sha256")),
+            ("malformed", lambda reference: reference.update(
+                {"source_sha256": "not-a-sha256"}
+            )),
+            ("mismatch", lambda reference: reference.update(
+                {"source_sha256": "0" * 64}
+            )),
+        ]
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root, images, _markdown = self.make_markdown_tree(
+                        temp_dir,
+                        "![plot](images/a.png)\n",
+                    )
+                    asset = images / "a.png"
+                    asset.write_bytes(b"asset")
+                    output = root / "plan"
+                    plan = rename_markdown_assets.create_plan(root, output)
+                    plan = json.loads(json.dumps(plan))
+                    mutate(plan["assets"][0]["references"][0])
+                    plan_path = output / "rename-plan.json"
+                    self.write_json(plan_path, plan)
+
+                    with self.assertRaises(RuntimeError):
+                        rename_markdown_assets.apply_plan(plan_path)
+
+                    self.assertTrue(asset.exists())
+
+    def test_preflight_rejects_unlisted_current_references_before_mutation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown = self.make_markdown_tree(
+                temp_dir,
+                "![first](images/a.png)\n![second](images/a.png)\n",
+            )
+            asset = images / "a.png"
+            asset.write_bytes(b"asset")
+            output = root / "plan"
+            plan = rename_markdown_assets.create_plan(root, output)
+            self.assertEqual(len(plan["assets"][0]["references"]), 2)
+            plan["assets"][0]["references"] = plan["assets"][0]["references"][:1]
+            plan_path = output / "rename-plan.json"
+            self.write_json(plan_path, plan)
+
+            with self.assertRaises(RuntimeError):
+                rename_markdown_assets.apply_plan(plan_path)
+
+            self.assertTrue(asset.exists())
+            self.assertIn("images/a.png", markdown.read_text(encoding="utf-8"))
+
+    def test_validate_plan_finds_stale_old_refs_in_unplanned_markdown(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown = self.make_markdown_tree(
+                temp_dir,
+                "![planned](images/a.png)\n",
+            )
+            asset = images / "a.png"
+            asset.write_bytes(b"asset")
+            output = root / "plan"
+            plan = rename_markdown_assets.create_plan(root, output)
+            plan_path = output / "rename-plan.json"
+            entry = plan["assets"][0]
+            new_asset = root / entry["new_path"]
+            asset.replace(new_asset)
+            new_destination = new_asset.relative_to(markdown.parent).as_posix()
+            markdown.write_text(
+                "![planned]({})\n".format(new_destination),
+                encoding="utf-8",
+            )
+            extra = root / "docs" / "extra.md"
+            extra.write_text("![stale](images/a.png)\n", encoding="utf-8")
+
+            errors = rename_markdown_assets.validate_plan(plan_path)
+
+        self.assertTrue(
+            any("stale old reference" in error for error in errors),
+            errors,
+        )
+
+    def test_preflight_rejects_duplicate_assets_and_reference_spans(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, _markdown = self.make_markdown_tree(
+                temp_dir,
+                "![plot](images/a.png)\n",
+            )
+            asset = images / "a.png"
+            asset.write_bytes(b"asset")
+            output = root / "plan"
+            clean_plan = rename_markdown_assets.create_plan(root, output)
+            plan_path = output / "rename-plan.json"
+
+            duplicate_asset = json.loads(json.dumps(clean_plan))
+            copied_entry = json.loads(json.dumps(duplicate_asset["assets"][0]))
+            copied_entry["new_path"] = "images/other.png"
+            duplicate_asset["assets"].append(copied_entry)
+            self.write_json(plan_path, duplicate_asset)
+            with self.assertRaises(RuntimeError):
+                rename_markdown_assets.apply_plan(plan_path)
+            self.assertTrue(asset.exists())
+
+            duplicate_reference = json.loads(json.dumps(clean_plan))
+            copied_reference = json.loads(json.dumps(
+                duplicate_reference["assets"][0]["references"][0]
+            ))
+            duplicate_reference["assets"][0]["references"].append(
+                copied_reference
+            )
+            self.write_json(plan_path, duplicate_reference)
+            with self.assertRaises(RuntimeError):
+                rename_markdown_assets.apply_plan(plan_path)
+            self.assertTrue(asset.exists())
+
     def test_create_plan_uses_injected_vision_only_for_generic_assets(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

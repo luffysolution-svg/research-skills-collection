@@ -2082,6 +2082,23 @@ def _reference_span_hash(path: Path, start: int, end: int) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _reference_identity(markdown_path: Path, start: int, end: int) -> tuple[str, int, int]:
+    return (_path_identity(markdown_path), start, end)
+
+
+def _active_markdown_files(root: Path) -> list[Path]:
+    documents = []
+    for document in iter_markdown_files(root):
+        try:
+            relative_parts = document.relative_to(root).parts
+        except ValueError:
+            continue
+        if ".rename-markdown-assets" in relative_parts:
+            continue
+        documents.append(document)
+    return documents
+
+
 def preflight_plan(
     plan: dict[str, object],
     plan_path: Path,
@@ -2103,6 +2120,9 @@ def preflight_plan(
 
     executable_assets = []
     target_keys: dict[str, str] = {}
+    old_path_keys: set[str] = set()
+    listed_references: dict[str, set[tuple[str, int, int]]] = {}
+    plan_reference_keys: set[tuple[str, int, int]] = set()
     for asset_index, entry in enumerate(assets):
         if not isinstance(entry, dict):
             errors.append("asset entry {} is not an object".format(asset_index))
@@ -2124,6 +2144,13 @@ def preflight_plan(
             errors.append("assets[{}].sha256 is invalid".format(asset_index))
         if old_abs is None or new_abs is None or not isinstance(sha256, str):
             continue
+        old_key = _path_identity(old_abs)
+        if old_key in old_path_keys:
+            errors.append("duplicate old_path entry: {}".format(
+                entry.get("old_path")
+            ))
+        old_path_keys.add(old_key)
+        listed_references.setdefault(old_key, set())
         if not old_abs.is_file():
             errors.append("source asset is missing: {}".format(entry.get("old_path")))
         else:
@@ -2185,13 +2212,28 @@ def preflight_plan(
                 ))
                 continue
             expected_hash = reference_entry.get("source_sha256")
-            if isinstance(expected_hash, str):
-                actual_hash = _reference_span_hash(document_abs, start, end)
-                if actual_hash != expected_hash:
-                    errors.append("reference destination span changed: {}".format(
-                        reference_entry.get("document")
-                    ))
-                    continue
+            if (
+                not isinstance(expected_hash, str)
+                or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
+            ):
+                errors.append("reference source_sha256 is required: {}".format(
+                    reference_entry.get("document")
+                ))
+                continue
+            reference_key = _reference_identity(document_abs, start, end)
+            if reference_key in plan_reference_keys:
+                errors.append("duplicate reference span entry: {}".format(
+                    reference_entry.get("document")
+                ))
+                continue
+            plan_reference_keys.add(reference_key)
+            listed_references[old_key].add(reference_key)
+            actual_hash = _reference_span_hash(document_abs, start, end)
+            if actual_hash != expected_hash:
+                errors.append("reference destination span changed: {}".format(
+                    reference_entry.get("document")
+                ))
+                continue
             matching = [
                 reference
                 for reference in scan_markdown(document_abs, root)
@@ -2226,6 +2268,21 @@ def preflight_plan(
                 "references": executable_references,
             }
         )
+
+    for document in _active_markdown_files(root):
+        for reference in scan_markdown(document, root):
+            old_key = _path_identity(reference.asset_path)
+            if old_key not in listed_references:
+                continue
+            reference_key = _reference_identity(
+                reference.markdown_path,
+                reference.start,
+                reference.end,
+            )
+            if reference_key not in listed_references[old_key]:
+                errors.append("current reference missing from plan: {}".format(
+                    reference.markdown_path.relative_to(root).as_posix()
+                ))
 
     if errors:
         raise RuntimeError("; ".join(errors))
@@ -2448,6 +2505,7 @@ def validate_plan(plan_path: Path) -> list[str]:
     if not isinstance(assets, list):
         return ["plan assets must be a list"]
 
+    stale_old_paths: dict[str, str] = {}
     for entry in assets:
         if not isinstance(entry, dict):
             errors.append("asset entry is not an object")
@@ -2466,38 +2524,30 @@ def validate_plan(plan_path: Path) -> list[str]:
         if old_abs is not None and _path_identity(old_abs) != _path_identity(new_abs):
             if old_abs.exists():
                 errors.append("old asset still exists: {}".format(old_path_text))
+            if isinstance(old_path_text, str):
+                stale_old_paths[old_path_text] = str(new_path_text)
 
     expected_counts = _planned_reference_counts(plan)
     actual_counts: dict[tuple[str, str], int] = {}
-    documents = sorted({document for document, _new in expected_counts})
-    for document_text in documents:
-        document_abs = _plan_relative_path(
-            root,
-            document_text,
-            "reference.document",
-            errors,
-        )
-        if document_abs is None or not document_abs.is_file():
-            errors.append("Markdown document is missing: {}".format(document_text))
-            continue
+    expected_documents = {document for document, _new in expected_counts}
+    scanned_documents = set()
+    stale_seen: set[tuple[str, str]] = set()
+    for document_abs in _active_markdown_files(root):
+        document_text = document_abs.relative_to(root).as_posix()
+        scanned_documents.add(document_text)
         for reference in scan_markdown(document_abs, root):
             relative_asset = reference.asset_path.relative_to(root).as_posix()
             key = (document_text, relative_asset)
             actual_counts[key] = actual_counts.get(key, 0) + 1
-            for entry in assets:
-                if not isinstance(entry, dict):
-                    continue
-                old_path_text = entry.get("old_path")
-                new_path_text = entry.get("new_path")
-                if (
-                    isinstance(old_path_text, str)
-                    and isinstance(new_path_text, str)
-                    and old_path_text != new_path_text
-                    and relative_asset == old_path_text
-                ):
+            if relative_asset in stale_old_paths:
+                stale_key = (document_text, relative_asset)
+                if stale_key not in stale_seen:
+                    stale_seen.add(stale_key)
                     errors.append("stale old reference remains: {}".format(
-                        old_path_text
+                        relative_asset
                     ))
+    for document_text in sorted(expected_documents - scanned_documents):
+        errors.append("Markdown document is missing: {}".format(document_text))
     for key, expected in expected_counts.items():
         actual = actual_counts.get(key, 0)
         if actual < expected:
