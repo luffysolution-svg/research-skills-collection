@@ -32,3 +32,6 @@ coverage/
 
 # Local source mirrors are intentionally excluded
 _sources/
+
+# Isolated feature worktrees
+.worktrees/
