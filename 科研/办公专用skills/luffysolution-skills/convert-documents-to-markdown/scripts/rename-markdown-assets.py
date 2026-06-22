@@ -1603,7 +1603,7 @@ def _apply_optional_vision(
     entries = cache["entries"]
     assert isinstance(entries, dict)
     status_by_path: dict[Path, str] = {}
-    processed = 0
+    vision_calls = 0
 
     for record in sorted(
         assets.values(),
@@ -1614,7 +1614,6 @@ def _apply_optional_vision(
         )
         if reason != "generic-fallback":
             continue
-        processed += 1
         key = vision_cache_key(
             record.sha256,
             str(config["model"]),
@@ -1629,8 +1628,12 @@ def _apply_optional_vision(
                 validated = None
             if validated is not None:
                 status = _vision_status_for_result(validated)
-                status_by_path[record.path] = status
                 if status == "used":
+                    status = "used-cache"
+                else:
+                    status = "{}-cache".format(status)
+                status_by_path[record.path] = status
+                if status == "used-cache":
                     record.evidence = [
                         {
                             "caption": validated["description"],
@@ -1640,6 +1643,7 @@ def _apply_optional_vision(
                     ]
                 continue
         try:
+            vision_calls += 1
             result = _validate_vision_result(
                 analyzer(record.path, _vision_context(record, root), config)
             )
@@ -1664,7 +1668,7 @@ def _apply_optional_vision(
             ]
 
     _write_vision_cache(output_dir, cache)
-    return status_by_path, config, processed
+    return status_by_path, config, vision_calls
 
 
 def check_vision() -> int:
