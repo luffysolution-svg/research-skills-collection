@@ -73,18 +73,6 @@ def _overlaps(ranges: list[tuple[int, int]], start: int, end: int) -> bool:
                for range_start, range_end in ranges)
 
 
-def _merge_ranges(
-    ranges: list[tuple[int, int]],
-) -> list[tuple[int, int]]:
-    merged: list[tuple[int, int]] = []
-    for start, end in sorted(ranges):
-        if merged and start < merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
-        else:
-            merged.append((start, end))
-    return merged
-
-
 def _is_escaped(text: str, position: int) -> bool:
     backslashes = 0
     position -= 1
@@ -94,76 +82,129 @@ def _is_escaped(text: str, position: int) -> bool:
     return backslashes % 2 == 1
 
 
+FENCE_LINE_PATTERN = re.compile(
+    r"^(?P<quotes>(?: {0,3}>[ \t]?)*)(?P<indent> {0,3})"
+    r"(?P<marker>`{3,}|~{3,})(?P<rest>.*)$"
+)
+
+
+def _line_bounds(text: str, start: int) -> tuple[int, int]:
+    line_end = text.find("\n", start)
+    if line_end == -1:
+        return len(text), len(text)
+    content_end = (
+        line_end - 1
+        if line_end > start and text[line_end - 1] == "\r"
+        else line_end
+    )
+    return content_end, line_end + 1
+
+
+def _fence_line(
+    text: str, line_start: int
+) -> tuple[int, str, int, str, int, int] | None:
+    content_end, next_line = _line_bounds(text, line_start)
+    match = FENCE_LINE_PATTERN.match(text[line_start:content_end])
+    if match is None:
+        return None
+    marker = match.group("marker")
+    rest = match.group("rest")
+    if marker[0] == "`" and "`" in rest:
+        return None
+    return (
+        match.group("quotes").count(">"),
+        marker[0],
+        len(marker),
+        rest,
+        content_end,
+        next_line,
+    )
+
+
+def _fence_end(
+    text: str,
+    next_line: int,
+    quote_depth: int,
+    marker_character: str,
+    marker_length: int,
+) -> tuple[int, int]:
+    line_start = next_line
+    while line_start < len(text):
+        parsed = _fence_line(text, line_start)
+        if parsed is not None:
+            depth, character, length, rest, content_end, after_line = parsed
+            if (
+                depth == quote_depth
+                and character == marker_character
+                and length >= marker_length
+                and not rest.strip()
+            ):
+                return content_end, after_line
+        _content_end, line_start = _line_bounds(text, line_start)
+    return len(text), len(text)
+
+
+def _inline_code_end(
+    text: str, start: int, delimiter: str
+) -> int | None:
+    position = start + len(delimiter)
+    while position < len(text):
+        line_start = position == 0 or text[position - 1] == "\n"
+        if line_start and _fence_line(text, position) is not None:
+            return None
+        if text.startswith(delimiter, position):
+            if (
+                not _is_escaped(text, position)
+                and (position == 0 or text[position - 1] != "`")
+                and (
+                    position + len(delimiter) == len(text)
+                    or text[position + len(delimiter)] != "`"
+                )
+            ):
+                return position + len(delimiter)
+            position += len(delimiter)
+            continue
+        position += 1
+    return None
+
+
 def protected_ranges(text: str) -> list[tuple[int, int]]:
     ranges: list[tuple[int, int]] = []
-    fence_pattern = re.compile(
-        r"(?m)^(?P<prefix>(?: {0,3}>[ \t]?)* {0,3})"
-        r"(?P<fence>`{3,}|~{3,})(?P<info>[^\r\n]*)(?:\r?\n|$)"
-    )
-    for opener in fence_pattern.finditer(text):
-        if _overlaps(ranges, opener.start(), opener.end()):
-            continue
-        fence = opener.group("fence")
-        if fence[0] == "`" and "`" in opener.group("info"):
-            continue
-        prefix = opener.group("prefix")
-        closer_pattern = re.compile(
-            rf"(?m)^{re.escape(prefix)}{re.escape(fence[0])}"
-            rf"{{{len(fence)},}}[ \t]*(?=\r?$)"
-        )
-        closer = closer_pattern.search(text, opener.end())
-        end = closer.end() if closer else len(text)
-        ranges.append((opener.start(), end))
-
-    ranges = _merge_ranges(ranges)
     position = 0
     while position < len(text):
-        start = text.find("<!--", position)
-        if start == -1:
-            break
-        if _overlaps(ranges, start, start + 4):
-            position = start + 4
-            continue
-        end = text.find("-->", start + 4)
-        while end != -1 and _overlaps(ranges, end, end + 3):
-            end = text.find("-->", end + 3)
-        end = end + 3 if end != -1 else len(text)
-        ranges.append((start, end))
-        ranges = _merge_ranges(ranges)
-        position = end
+        line_start = position == 0 or text[position - 1] == "\n"
+        if line_start:
+            fence = _fence_line(text, position)
+            if fence is not None:
+                depth, character, length, _rest, _line_end, next_line = fence
+                end, after_fence = _fence_end(
+                    text, next_line, depth, character, length
+                )
+                ranges.append((position, end))
+                position = after_fence
+                continue
 
-    position = 0
-    while position < len(text):
-        opener = re.search(r"`+", text[position:])
-        if not opener:
-            break
-        start = position + opener.start()
-        run = opener.group()
-        if (
-            _is_escaped(text, start)
-            or _overlaps(ranges, start, start + len(run))
-        ):
-            position = start + len(run)
+        if text.startswith("<!--", position):
+            comment_end = text.find("-->", position + 4)
+            end = comment_end + 3 if comment_end != -1 else len(text)
+            ranges.append((position, end))
+            position = end
             continue
-        search_from = start + len(run)
-        end = text.find(run, search_from)
-        while end != -1 and (
-            _is_escaped(text, end)
-            or _overlaps(ranges, end, end + len(run))
-            or (end > 0 and text[end - 1] == "`")
-            or (
-                end + len(run) < len(text)
-                and text[end + len(run)] == "`"
-            )
-        ):
-            end = text.find(run, end + len(run))
-        if end == -1:
-            position = search_from
-            continue
-        ranges.append((start, end + len(run)))
-        ranges = _merge_ranges(ranges)
-        position = end + len(run)
 
+        if text[position] == "`" and not _is_escaped(text, position):
+            delimiter_end = position + 1
+            while delimiter_end < len(text) and text[delimiter_end] == "`":
+                delimiter_end += 1
+            delimiter = text[position:delimiter_end]
+            end = _inline_code_end(text, position, delimiter)
+            if end is not None:
+                ranges.append((position, end))
+                position = end
+                continue
+            position = delimiter_end
+            continue
+
+        position += 1
     return ranges
 
 
@@ -222,6 +263,8 @@ def _destination_span(
         start = position + 1
         position = start
         while position < len(text):
+            if text[position] in "\r\n":
+                return None
             if text[position] == ">" and (
                 position == start or text[position - 1] != "\\"
             ):
@@ -387,6 +430,16 @@ def scan_markdown(path: Path, root: Path) -> list[Reference]:
         position += 1
         while position < len(text) and text[position] in " \t":
             position += 1
+        if position < len(text) and text[position] in "\r\n":
+            if text.startswith("\r\n", position):
+                position += 2
+            else:
+                position += 1
+            indentation_start = position
+            while position < len(text) and text[position] == " ":
+                position += 1
+            if not 1 <= position - indentation_start <= 3:
+                continue
         if position >= len(text) or text[position] in "\r\n":
             continue
         if text[position] == "<":

@@ -280,6 +280,27 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             ["images/a.png"],
         )
 
+    def test_reference_definition_destination_may_follow_indented_line(self):
+        markdown = (
+            "![plot]\n"
+            "[plot]:\n"
+            "  images/a.png\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "a.png").write_bytes(b"asset")
+
+            references = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )
+
+        self.assertEqual(
+            [reference.decoded_destination for reference in references],
+            ["images/a.png"],
+        )
+
     def test_scan_markdown_shortcut_uses_first_normalized_definition(self):
         markdown = (
             "![Plot   Name]\n"
@@ -363,6 +384,46 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             )
             for name in ("plain.png", "title.png", "valid.png"):
                 (images / name).write_bytes(b"asset")
+
+            references = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )
+
+        self.assertEqual(
+            [reference.decoded_destination for reference in references],
+            ["images/valid.png"],
+        )
+
+    def test_inline_code_comment_marker_does_not_open_html_comment(self):
+        markdown = (
+            "`<!--`\n"
+            "![after](images/after.png)\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "after.png").write_bytes(b"asset")
+
+            references = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )
+
+        self.assertEqual(
+            [reference.decoded_destination for reference in references],
+            ["images/after.png"],
+        )
+
+    def test_angle_inline_destination_cannot_cross_line_ending(self):
+        markdown = (
+            "![invalid](<images/a\nb.png>)\n"
+            "![valid](images/valid.png)\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "valid.png").write_bytes(b"asset")
 
             references = rename_markdown_assets.scan_markdown(
                 markdown_path, root
@@ -596,6 +657,29 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             )
             (images / "inside-tilde.png").write_bytes(b"asset")
             (images / "inside-backtick.png").write_bytes(b"asset")
+            (images / "outside.png").write_bytes(b"asset")
+
+            references = rename_markdown_assets.scan_markdown(
+                markdown_path, root
+            )
+
+        self.assertEqual(
+            [reference.decoded_destination for reference in references],
+            ["images/outside.png"],
+        )
+
+    def test_blockquoted_fence_closer_allows_spacing_and_longer_marker(self):
+        markdown = (
+            "> ```md\n"
+            "> ![inside](images/inside.png)\n"
+            ">````\n"
+            "![outside](images/outside.png)\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "inside.png").write_bytes(b"asset")
             (images / "outside.png").write_bytes(b"asset")
 
             references = rename_markdown_assets.scan_markdown(
