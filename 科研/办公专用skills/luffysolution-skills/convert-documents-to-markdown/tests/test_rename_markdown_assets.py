@@ -899,6 +899,269 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
         self.assertEqual(unreferenced_paths, {str(local_unused.resolve())})
         self.assertNotIn(str(unrelated_image.resolve()), unreferenced_paths)
 
+    def test_discovers_exact_and_prefixed_content_list_variants(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images = root / "images"
+            images.mkdir()
+            filenames = [
+                "content_list.json",
+                "content_list_v2.json",
+                "alpha_content_list.json",
+                "beta_content_list_v2.json",
+            ]
+            expected_sources = []
+            for index, filename in enumerate(filenames):
+                image = images / f"{index}.png"
+                image.write_bytes(str(index).encode())
+                self.write_json(
+                    root / filename,
+                    [{"img_path": f"images/{index}.png"}],
+                )
+                expected_sources.append(Path(filename).stem)
+            self.write_json(
+                root / "not_content_list_v3.json",
+                [{"img_path": "images/0.png", "caption": "ignored"}],
+            )
+
+            metadata = rename_markdown_assets.load_mineru_metadata(root)
+
+        self.assertEqual(
+            [
+                evidence[0]["source"]
+                for _path, evidence in sorted(metadata.items())
+            ],
+            expected_sources,
+        )
+
+    def test_content_list_v2_merges_parent_path_with_nested_content(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image = root / "images" / "shared.png"
+            image.parent.mkdir()
+            image.write_bytes(b"shared")
+            self.write_json(
+                root / "report_content_list_v2.json",
+                [
+                    {
+                        "img_path": "images/shared.png",
+                        "content": {
+                            "image_caption": ["Merged caption"],
+                            "page_idx": "3",
+                            "bbox": [1, 2.5, 3, 4],
+                            "sub_type": "chart",
+                        },
+                    }
+                ],
+            )
+
+            metadata = rename_markdown_assets.load_mineru_metadata(root)
+
+        self.assertEqual(
+            metadata[image.resolve()],
+            [
+                {
+                    "path": str(image.resolve()),
+                    "caption": "Merged caption",
+                    "visual_type": "chart",
+                    "page_idx": 3,
+                    "bbox": [1, 2.5, 3, 4],
+                    "source": "report_content_list_v2",
+                }
+            ],
+        )
+
+    def test_metadata_skips_bad_paths_and_normalizes_malformed_fields(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image = root / "images" / "valid.png"
+            image.parent.mkdir()
+            image.write_bytes(b"valid")
+            self.write_json(
+                root / "content_list.json",
+                [
+                    {"img_path": ""},
+                    {"img_path": "images/bad\u0000.png"},
+                    {"img_path": "images/not-supported.txt"},
+                    {
+                        "img_path": "images/valid.png",
+                        "caption": {"bad": "shape"},
+                        "page_idx": -1,
+                        "bbox": [1, float("nan"), 3, 4],
+                        "type": ["bad-shape"],
+                    },
+                    {
+                        "img_path": "images/valid.png",
+                        "caption": [" First ", 7, "", "Second"],
+                        "page_idx": 4.0,
+                        "bbox": [1, 2, 3, 4],
+                        "type": " image ",
+                    },
+                ],
+            )
+
+            metadata = rename_markdown_assets.load_mineru_metadata(root)
+
+        self.assertEqual(
+            metadata[image.resolve()],
+            [
+                {
+                    "path": str(image.resolve()),
+                    "caption": "",
+                    "visual_type": "image",
+                    "page_idx": None,
+                    "bbox": None,
+                    "source": "content_list",
+                },
+                {
+                    "path": str(image.resolve()),
+                    "caption": "First Second",
+                    "visual_type": "image",
+                    "page_idx": 4,
+                    "bbox": [1, 2, 3, 4],
+                    "source": "content_list",
+                },
+            ],
+        )
+
+    def test_missing_root_asset_does_not_expand_unreferenced_scan_scope(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            markdown = root / "report.md"
+            markdown.write_text("![missing](missing.png)\n", encoding="utf-8")
+            unrelated = root / "unrelated.png"
+            unrelated.write_bytes(b"unrelated")
+
+            _documents, _assets, warnings = (
+                rename_markdown_assets.build_asset_graph(root)
+            )
+
+        self.assertEqual(
+            warnings,
+            [
+                {
+                    "code": "missing-asset",
+                    "path": str((root / "missing.png").resolve()),
+                }
+            ],
+        )
+
+    def test_iter_markdown_files_is_case_insensitive(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            docs = root / "docs"
+            docs.mkdir()
+            lower = docs / "a.md"
+            upper = docs / "B.MD"
+            lower.write_text("lower", encoding="utf-8")
+            upper.write_text("upper", encoding="utf-8")
+
+            documents = rename_markdown_assets.iter_markdown_files(root)
+
+        self.assertEqual(
+            documents,
+            sorted([lower.resolve(), upper.resolve()]),
+        )
+
+    def test_iter_markdown_files_rejects_canonical_escapes_and_deduplicates(
+        self,
+    ):
+        root = Path("C:/workspace").resolve(strict=False)
+        lower = root / "docs" / "a.md"
+        alias = root / "docs" / "alias.md"
+        outside_link = root / "docs" / "outside.md"
+        outside = Path("C:/outside.md").resolve(strict=False)
+        real_resolve = Path.resolve
+
+        def resolve_candidates(path, strict=False):
+            if path == alias:
+                return lower
+            if path == outside_link:
+                return outside
+            return real_resolve(path, strict=strict)
+
+        with (
+            patch.object(
+                Path,
+                "rglob",
+                autospec=True,
+                return_value=[outside_link, alias, lower],
+            ),
+            patch.object(Path, "is_file", autospec=True, return_value=True),
+            patch.object(
+                Path,
+                "resolve",
+                autospec=True,
+                side_effect=resolve_candidates,
+            ),
+        ):
+            documents = rename_markdown_assets.iter_markdown_files(root)
+
+        self.assertEqual(documents, [lower])
+
+    def test_graph_attaches_ordered_metadata_and_hashes_shared_asset_once(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images = root / "images"
+            docs = root / "docs"
+            images.mkdir()
+            docs.mkdir()
+            shared = images / "shared.png"
+            shared.write_bytes(b"shared")
+            (docs / "a.md").write_text(
+                "![one](../images/shared.png)\n",
+                encoding="utf-8",
+            )
+            (docs / "b.MD").write_text(
+                "![two](../images/shared.png)\n",
+                encoding="utf-8",
+            )
+            self.write_json(
+                root / "b_content_list_v2.json",
+                [
+                    {
+                        "img_path": "images/shared.png",
+                        "caption": "second",
+                    }
+                ],
+            )
+            self.write_json(
+                root / "a_content_list.json",
+                [
+                    {
+                        "img_path": "images/shared.png",
+                        "caption": "first",
+                    },
+                    {
+                        "img_path": "images/shared.png",
+                        "caption": "first",
+                    },
+                ],
+            )
+
+            with patch.object(
+                rename_markdown_assets,
+                "sha256_file",
+                wraps=rename_markdown_assets.sha256_file,
+            ) as hash_file:
+                _documents, assets, _warnings = (
+                    rename_markdown_assets.build_asset_graph(root)
+                )
+
+        record = assets[shared.resolve()]
+        self.assertEqual(len(record.references), 2)
+        self.assertEqual(
+            [
+                (item["source"], item["caption"])
+                for item in record.evidence
+            ],
+            [
+                ("a_content_list", "first"),
+                ("b_content_list_v2", "second"),
+            ],
+        )
+        hash_file.assert_called_once_with(shared.resolve())
+
 
 if __name__ == "__main__":
     unittest.main()

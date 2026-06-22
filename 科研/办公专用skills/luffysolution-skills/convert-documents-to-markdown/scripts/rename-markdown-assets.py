@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import html
 import json
+import math
 import re
 import sys
 import unicodedata
@@ -513,11 +514,20 @@ def scan_markdown(path: Path, root: Path) -> list[Reference]:
 
 def iter_markdown_files(root: Path) -> list[Path]:
     canonical_root = root.resolve(strict=False)
-    return sorted(
-        path
-        for path in canonical_root.rglob("*.md")
-        if path.is_file()
-    )
+    documents: set[Path] = set()
+    for path in canonical_root.rglob("*"):
+        if path.suffix.casefold() != ".md" or not path.is_file():
+            continue
+        try:
+            canonical_path = path.resolve(strict=False)
+        except (OSError, RuntimeError):
+            continue
+        if (
+            canonical_path.is_relative_to(canonical_root)
+            and canonical_path.is_file()
+        ):
+            documents.add(canonical_path)
+    return sorted(documents)
 
 
 METADATA_PATH_KEYS = (
@@ -533,20 +543,26 @@ METADATA_CAPTION_KEYS = (
     "chart_caption",
     "caption",
 )
+METADATA_TYPE_KEYS = ("visual_type", "sub_type", "type")
+METADATA_PAGE_KEYS = ("page_idx", "page_index", "page")
+METADATA_RECORD_KEYS = (
+    METADATA_PATH_KEYS
+    + METADATA_CAPTION_KEYS
+    + METADATA_TYPE_KEYS
+    + METADATA_PAGE_KEYS
+    + ("bbox",)
+)
 
 
 def _metadata_files(root: Path) -> list[Path]:
-    filenames = {"content_list.json", "content_list_v2.json"}
     return sorted(
         path
         for path in root.rglob("*.json")
         if path.is_file()
-        and (
-            path.name.casefold() in filenames
-            or (
-                path.name.casefold().endswith("_content_list.json")
-                and len(path.name) > len("_content_list.json")
-            )
+        and re.fullmatch(
+            r"(?:content_list(?:_v2)?|.+_content_list(?:_v2)?)\.json",
+            path.name,
+            re.IGNORECASE,
         )
     )
 
@@ -560,39 +576,95 @@ def _metadata_records(value, inherited=None):
     if not isinstance(value, dict):
         return
 
-    local = dict(inherited)
-    local.update(
-        (key, item)
+    own_fields = {
+        key: value[key]
+        for key in METADATA_RECORD_KEYS
+        if key in value
+    }
+    merged = dict(inherited)
+    merged.update(own_fields)
+    children = [
+        item
         for key, item in value.items()
-        if not isinstance(item, dict)
-    )
-    if any(
-        key in value and isinstance(value[key], (str, Path))
-        for key in METADATA_PATH_KEYS
-    ):
-        yield local
-
-    for item in value.values():
-        if isinstance(item, (dict, list)):
-            yield from _metadata_records(item, local)
+        if key not in METADATA_RECORD_KEYS
+        and isinstance(item, (dict, list))
+    ]
+    child_records = []
+    for child in children:
+        child_records.extend(_metadata_records(child, merged))
+    if child_records:
+        yield from child_records
+    elif own_fields and any(key in merged for key in METADATA_PATH_KEYS):
+        yield merged
 
 
 def _caption_text(record: dict[str, object]) -> str:
     for key in METADATA_CAPTION_KEYS:
         value = record.get(key)
         if isinstance(value, str):
-            caption = value.strip()
+            caption = re.sub(r"\s+", " ", value).strip()
             if caption:
                 return caption
-        if isinstance(value, list):
+        if isinstance(value, (list, tuple)):
             parts = [
-                item.strip()
+                re.sub(r"\s+", " ", item).strip()
                 for item in value
-                if isinstance(item, str) and item.strip()
+                if isinstance(item, str)
+                and re.sub(r"\s+", " ", item).strip()
             ]
             if parts:
                 return " ".join(parts)
     return ""
+
+
+def _visual_type(record: dict[str, object]) -> str:
+    for key in METADATA_TYPE_KEYS:
+        value = record.get(key)
+        if isinstance(value, str):
+            normalized = re.sub(r"\s+", " ", value).strip()
+            if normalized:
+                return normalized
+    return "image"
+
+
+def _page_index(record: dict[str, object]) -> int | None:
+    value = next(
+        (
+            record[key]
+            for key in METADATA_PAGE_KEYS
+            if key in record
+        ),
+        None,
+    )
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        if math.isfinite(value) and value >= 0 and value.is_integer():
+            return int(value)
+        return None
+    if isinstance(value, str):
+        normalized = value.strip()
+        if re.fullmatch(r"\+?\d+", normalized):
+            return int(normalized)
+    return None
+
+
+def _bbox(record: dict[str, object]) -> list[int | float] | None:
+    value = record.get("bbox")
+    if not isinstance(value, (list, tuple)) or not value:
+        return None
+    normalized = []
+    for coordinate in value:
+        if (
+            isinstance(coordinate, bool)
+            or not isinstance(coordinate, (int, float))
+            or not math.isfinite(coordinate)
+        ):
+            return None
+        normalized.append(coordinate)
+    return normalized
 
 
 def _metadata_asset_path(
@@ -612,12 +684,18 @@ def _metadata_asset_path(
     if raw_path is None:
         return None
 
-    decoded_path = unquote(
-        _without_url_suffix(html.unescape(str(raw_path).strip()))
-    )
-    if not decoded_path:
+    raw_text = str(raw_path).strip()
+    if not raw_text or "\x00" in raw_text:
         return None
-    parsed_path = Path(decoded_path)
+    decoded_path = unquote(
+        _without_url_suffix(html.unescape(raw_text))
+    ).strip()
+    if not decoded_path or "\x00" in decoded_path:
+        return None
+    try:
+        parsed_path = Path(decoded_path)
+    except (OSError, ValueError):
+        return None
     if (
         not parsed_path.is_absolute()
         and re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", decoded_path)
@@ -625,13 +703,16 @@ def _metadata_asset_path(
         return None
 
     canonical_root = root.resolve(strict=False)
-    if parsed_path.is_absolute():
-        candidates = [parsed_path.resolve(strict=False)]
-    else:
-        candidates = [
-            (metadata_path.parent / parsed_path).resolve(strict=False),
-            (canonical_root / parsed_path).resolve(strict=False),
-        ]
+    try:
+        if parsed_path.is_absolute():
+            candidates = [parsed_path.resolve(strict=False)]
+        else:
+            candidates = [
+                (metadata_path.parent / parsed_path).resolve(strict=False),
+                (canonical_root / parsed_path).resolve(strict=False),
+            ]
+    except (OSError, RuntimeError, ValueError):
+        return None
     contained = [
         candidate
         for candidate in candidates
@@ -653,7 +734,7 @@ def load_mineru_metadata(
 ) -> dict[Path, list[dict[str, object]]]:
     canonical_root = root.resolve(strict=False)
     metadata: dict[Path, list[dict[str, object]]] = {}
-    seen: set[tuple[Path, str, str, str]] = set()
+    seen: set[tuple[object, ...]] = set()
     for metadata_path in _metadata_files(canonical_root):
         try:
             value = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -666,31 +747,21 @@ def load_mineru_metadata(
             )
             if asset_path is None:
                 continue
-            visual_type = next(
-                (
-                    str(record[key]).strip()
-                    for key in ("visual_type", "sub_type", "type")
-                    if record.get(key) is not None
-                    and str(record[key]).strip()
-                ),
-                "image",
-            )
             evidence = {
                 "path": str(asset_path),
                 "caption": _caption_text(record),
-                "visual_type": visual_type,
-                "page_idx": record.get(
-                    "page_idx",
-                    record.get("page_index", record.get("page")),
-                ),
-                "bbox": record.get("bbox"),
+                "visual_type": _visual_type(record),
+                "page_idx": _page_index(record),
+                "bbox": _bbox(record),
                 "source": source,
             }
             identity = (
+                metadata_path,
                 asset_path,
-                repr(evidence),
-                source,
-                str(metadata_path),
+                evidence["caption"],
+                evidence["visual_type"],
+                evidence["page_idx"],
+                repr(evidence["bbox"]),
             )
             if identity in seen:
                 continue
@@ -722,7 +793,6 @@ def build_asset_graph(
     warnings: list[dict[str, str]] = []
     referenced_directories: set[Path] = set()
     for asset_path in sorted(grouped):
-        referenced_directories.add(asset_path.parent)
         if not asset_path.is_file():
             warnings.append(
                 {
@@ -731,6 +801,7 @@ def build_asset_graph(
                 }
             )
             continue
+        referenced_directories.add(asset_path.parent)
         assets[asset_path] = AssetRecord(
             path=asset_path,
             sha256=sha256_file(asset_path),
