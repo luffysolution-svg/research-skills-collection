@@ -2385,6 +2385,127 @@ def _load_plan(plan_path: Path) -> dict[str, object]:
     return plan
 
 
+def _maybe_inject_failure(fail_after: Optional[str], checkpoint: str) -> None:
+    if fail_after == checkpoint:
+        raise RuntimeError("injected failure after {}".format(checkpoint))
+
+
+def _rollback_asset_move(
+    source: Path,
+    target: Path,
+    errors: list[str],
+) -> None:
+    source_exists = source.exists()
+    target_exists = target.exists()
+    if source_exists and target_exists:
+        errors.append("rollback source and target both exist: {}".format(target))
+    elif target_exists:
+        os.replace(target, source)
+    elif source_exists:
+        return
+    else:
+        errors.append("rollback source and target missing: {}".format(target))
+
+
+def _rollback_markdown_replace(
+    target: Path,
+    backup: Path,
+    errors: list[str],
+) -> None:
+    if not backup.is_file():
+        errors.append("rollback backup missing: {}".format(backup))
+        return
+    _atomic_replace_bytes(target, backup.read_bytes())
+
+
+def _rollback_completed_operation(
+    operation: dict[str, object],
+    errors: list[str],
+) -> None:
+    kind = operation.get("kind")
+    if kind == "markdown-backup":
+        return
+    if kind in ("asset-old-to-temp", "asset-temp-to-target"):
+        source_value = operation.get("source")
+        target_value = operation.get("target")
+        if not isinstance(source_value, str) or not isinstance(target_value, str):
+            errors.append("rollback asset operation is missing paths")
+            return
+        _rollback_asset_move(Path(source_value), Path(target_value), errors)
+        return
+    if kind == "markdown-replace":
+        target_value = operation.get("target")
+        backup_value = operation.get("backup")
+        if not isinstance(target_value, str) or not isinstance(backup_value, str):
+            errors.append("rollback markdown operation is missing paths")
+            return
+        _rollback_markdown_replace(
+            Path(target_value),
+            Path(backup_value),
+            errors,
+        )
+        return
+    errors.append("unknown rollback operation kind: {}".format(kind))
+
+
+def rollback_transaction(transaction_path: Path) -> list[str]:
+    transaction_path = Path(transaction_path).resolve(strict=False)
+    errors: list[str] = []
+    try:
+        journal = json.loads(transaction_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return ["unable to read transaction: {}".format(exc)]
+    if not isinstance(journal, dict) or journal.get("schema") != 1:
+        return ["unsupported transaction schema"]
+    operations = journal.get("operations")
+    if not isinstance(operations, list):
+        return ["transaction operations must be a list"]
+    if journal.get("state") == "rolled-back":
+        return []
+
+    journal["state"] = "rolling-back"
+    _atomic_write_json(transaction_path, journal)
+    for operation in reversed(operations):
+        if not isinstance(operation, dict):
+            errors.append("transaction operation is not an object")
+            continue
+        if operation.get("rollback_status") == "completed":
+            continue
+        if operation.get("status") not in ("completed", "started"):
+            continue
+        before = len(errors)
+        try:
+            _rollback_completed_operation(operation, errors)
+        except Exception as exc:
+            errors.append("rollback failed: {}".format(exc))
+        if len(errors) == before:
+            operation["rollback_status"] = "completed"
+        else:
+            operation["rollback_status"] = "failed"
+            operation["rollback_error"] = errors[-1]
+        _atomic_write_json(transaction_path, journal)
+
+    journal["state"] = "rollback-incomplete" if errors else "rolled-back"
+    if errors:
+        journal["rollback_errors"] = errors
+    _atomic_write_json(transaction_path, journal)
+    return errors
+
+
+def _raise_apply_failure(
+    exc: Exception,
+    journal_path: Path,
+    rollback_errors: list[str],
+) -> None:
+    message = "{}; transaction: {}".format(exc, journal_path.as_posix())
+    if rollback_errors:
+        message = "{}; rollback errors: {}".format(
+            message,
+            "; ".join(rollback_errors),
+        )
+    raise RuntimeError(message) from exc
+
+
 def apply_plan(plan_path: Path, fail_after=None) -> dict[str, object]:
     plan_path = Path(plan_path).resolve(strict=False)
     plan = _load_plan(plan_path)
@@ -2402,112 +2523,119 @@ def apply_plan(plan_path: Path, fail_after=None) -> dict[str, object]:
     }
     _atomic_write_json(journal_path, journal)
 
-    moved_assets = []
-    for index, asset in enumerate(executable["assets"]):
-        old_path = asset["old_path"]
-        new_path = asset["new_path"]
-        if _path_identity(old_path) == _path_identity(new_path):
-            continue
-        temp_path = _asset_temp_path(old_path, transaction_id, index)
-        temp_index = index
-        while temp_path.exists():
-            temp_index += len(executable["assets"]) + 1
-            temp_path = _asset_temp_path(old_path, transaction_id, temp_index)
-        op_index = _start_journal_op(
-            journal_path,
-            journal,
-            {
-                "kind": "asset-old-to-temp",
-                "op": "move-asset-to-temp",
-                "source": old_path.as_posix(),
-                "target": temp_path.as_posix(),
-                "temp": temp_path.as_posix(),
-            },
-        )
-        os.replace(old_path, temp_path)
-        moved_assets.append((temp_path, new_path))
-        _complete_journal_op(journal_path, journal, op_index)
-        op_index = _start_journal_op(
-            journal_path,
-            journal,
-            {
-                "kind": "asset-temp-to-target",
-                "op": "move-temp-to-target",
-                "source": temp_path.as_posix(),
-                "target": new_path.as_posix(),
-                "temp": temp_path.as_posix(),
-                "old_path": old_path.as_posix(),
-            },
-        )
-        os.replace(temp_path, new_path)
-        _complete_journal_op(journal_path, journal, op_index)
-
-    replacements_by_document: dict[Path, list[tuple[int, int, bytes]]] = {}
-    for asset in executable["assets"]:
-        for reference in asset["references"]:
-            markdown_reference = reference["reference"]
-            replacements_by_document.setdefault(
-                reference["document"],
-                [],
-            ).append(
-                (
-                    markdown_reference.start,
-                    markdown_reference.end,
-                    reference["replacement"],
-                )
+    try:
+        for index, asset in enumerate(executable["assets"]):
+            old_path = asset["old_path"]
+            new_path = asset["new_path"]
+            if _path_identity(old_path) == _path_identity(new_path):
+                continue
+            temp_path = _asset_temp_path(old_path, transaction_id, index)
+            temp_index = index
+            while temp_path.exists():
+                temp_index += len(executable["assets"]) + 1
+                temp_path = _asset_temp_path(old_path, transaction_id, temp_index)
+            op_index = _start_journal_op(
+                journal_path,
+                journal,
+                {
+                    "kind": "asset-old-to-temp",
+                    "op": "move-asset-to-temp",
+                    "source": old_path.as_posix(),
+                    "target": temp_path.as_posix(),
+                    "temp": temp_path.as_posix(),
+                },
             )
+            os.replace(old_path, temp_path)
+            _complete_journal_op(journal_path, journal, op_index)
+            _maybe_inject_failure(fail_after, "asset-staged")
+            op_index = _start_journal_op(
+                journal_path,
+                journal,
+                {
+                    "kind": "asset-temp-to-target",
+                    "op": "move-temp-to-target",
+                    "source": temp_path.as_posix(),
+                    "target": new_path.as_posix(),
+                    "temp": temp_path.as_posix(),
+                    "old_path": old_path.as_posix(),
+                },
+            )
+            os.replace(temp_path, new_path)
+            _complete_journal_op(journal_path, journal, op_index)
+            _maybe_inject_failure(fail_after, "asset-committed")
 
-    backup_root = transaction_dir / "markdown-backups"
-    root = executable["root"]
-    assert isinstance(root, Path)
-    for document, replacements in sorted(
-        replacements_by_document.items(),
-        key=lambda item: item[0].as_posix().casefold(),
-    ):
-        original = document.read_bytes()
-        relative_document = document.relative_to(root)
-        backup_path = backup_root / relative_document
-        backup_temp = _atomic_replace_temp_path(backup_path, original)
-        op_index = _start_journal_op(
-            journal_path,
-            journal,
-            {
-                "kind": "markdown-backup",
-                "op": "backup-markdown",
-                "source": document.as_posix(),
-                "target": backup_path.as_posix(),
-                "backup": backup_path.as_posix(),
-                "temp": backup_temp.as_posix(),
-            },
-        )
-        _atomic_replace_bytes(backup_path, original, backup_temp)
-        _complete_journal_op(journal_path, journal, op_index)
-        rewritten = rewrite_markdown_bytes(original, replacements)
-        markdown_temp = _atomic_replace_temp_path(document, rewritten)
-        op_index = _start_journal_op(
-            journal_path,
-            journal,
-            {
-                "kind": "markdown-replace",
-                "op": "replace-markdown",
-                "source": document.as_posix(),
-                "target": document.as_posix(),
-                "backup": backup_path.as_posix(),
-                "temp": markdown_temp.as_posix(),
-            },
-        )
-        _atomic_replace_bytes(document, rewritten, markdown_temp)
-        _complete_journal_op(journal_path, journal, op_index)
+        replacements_by_document: dict[Path, list[tuple[int, int, bytes]]] = {}
+        for asset in executable["assets"]:
+            for reference in asset["references"]:
+                markdown_reference = reference["reference"]
+                replacements_by_document.setdefault(
+                    reference["document"],
+                    [],
+                ).append(
+                    (
+                        markdown_reference.start,
+                        markdown_reference.end,
+                        reference["replacement"],
+                    )
+                )
 
-    validation_errors = validate_plan(plan_path)
-    if validation_errors:
-        journal["state"] = "validation-failed"
-        journal["validation_errors"] = validation_errors
+        backup_root = transaction_dir / "markdown-backups"
+        root = executable["root"]
+        assert isinstance(root, Path)
+        for document, replacements in sorted(
+            replacements_by_document.items(),
+            key=lambda item: item[0].as_posix().casefold(),
+        ):
+            original = document.read_bytes()
+            relative_document = document.relative_to(root)
+            backup_path = backup_root / relative_document
+            backup_temp = _atomic_replace_temp_path(backup_path, original)
+            op_index = _start_journal_op(
+                journal_path,
+                journal,
+                {
+                    "kind": "markdown-backup",
+                    "op": "backup-markdown",
+                    "source": document.as_posix(),
+                    "target": backup_path.as_posix(),
+                    "backup": backup_path.as_posix(),
+                    "temp": backup_temp.as_posix(),
+                },
+            )
+            _atomic_replace_bytes(backup_path, original, backup_temp)
+            _complete_journal_op(journal_path, journal, op_index)
+            _maybe_inject_failure(fail_after, "markdown-staged")
+            rewritten = rewrite_markdown_bytes(original, replacements)
+            markdown_temp = _atomic_replace_temp_path(document, rewritten)
+            op_index = _start_journal_op(
+                journal_path,
+                journal,
+                {
+                    "kind": "markdown-replace",
+                    "op": "replace-markdown",
+                    "source": document.as_posix(),
+                    "target": document.as_posix(),
+                    "backup": backup_path.as_posix(),
+                    "temp": markdown_temp.as_posix(),
+                },
+            )
+            _atomic_replace_bytes(document, rewritten, markdown_temp)
+            _complete_journal_op(journal_path, journal, op_index)
+            _maybe_inject_failure(fail_after, "markdown-committed")
+
+        validation_errors = validate_plan(plan_path)
+        if validation_errors:
+            journal["state"] = "validation-failed"
+            journal["validation_errors"] = validation_errors
+            _atomic_write_json(journal_path, journal)
+            raise RuntimeError("; ".join(validation_errors))
+
+        journal["state"] = "committed"
         _atomic_write_json(journal_path, journal)
-        raise RuntimeError("; ".join(validation_errors))
+    except Exception as exc:
+        rollback_errors = rollback_transaction(journal_path)
+        _raise_apply_failure(exc, journal_path, rollback_errors)
 
-    journal["state"] = "committed"
-    _atomic_write_json(journal_path, journal)
     return {
         "state": "committed",
         "transaction_path": journal_path.as_posix(),
