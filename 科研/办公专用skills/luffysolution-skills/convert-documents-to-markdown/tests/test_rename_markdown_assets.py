@@ -1917,6 +1917,179 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             },
         )
 
+    def test_rewrite_markdown_bytes_only_replaces_requested_spans(self):
+        source = (
+            b'![plot](images/a%20b.png "title")\r\n'
+            b"<details>keep</details>\r\n"
+            b"[plot]: <images/a%20b.png> 'caption'\r\n"
+        )
+        first = source.index(b"images/a%20b.png")
+        second = source.rindex(b"images/a%20b.png")
+
+        rewritten = rename_markdown_assets.rewrite_markdown_bytes(
+            source,
+            [
+                (first, first + len(b"images/a%20b.png"), b"images/new.png"),
+                (second, second + len(b"images/a%20b.png"), b"images/new.png"),
+            ],
+        )
+
+        self.assertEqual(
+            rewritten,
+            (
+                b'![plot](images/new.png "title")\r\n'
+                b"<details>keep</details>\r\n"
+                b"[plot]: <images/new.png> 'caption'\r\n"
+            ),
+        )
+        self.assertIn(b'"title"', rewritten)
+        self.assertIn(b"<details>keep</details>", rewritten)
+        self.assertIn(b"\r\n", rewritten)
+        with self.assertRaises(ValueError):
+            rename_markdown_assets.rewrite_markdown_bytes(
+                source,
+                [(0, 5, b"a"), (4, 8, b"b")],
+            )
+
+    def test_apply_plan_renames_assets_rewrites_references_and_commits(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            docs = root / "docs"
+            images = root / "images"
+            output = root / "plan"
+            docs.mkdir()
+            images.mkdir()
+            space_asset = images / "a b.png"
+            raw_asset = images / "\u56fe.png"
+            space_asset.write_bytes(b"space-asset")
+            raw_asset.write_bytes(b"raw-asset")
+            markdown = docs / "report.md"
+            markdown.write_text(
+                "# Report\r\n"
+                '![percent](../images/a%20b.png "title")\r\n'
+                "![raw](../images/\u56fe.png)\r\n"
+                "![again][plot]\r\n"
+                "[plot]: <../images/a%20b.png> 'caption'\r\n"
+                "<details>unchanged</details>\r\n"
+                '<img alt="chart" src="../images/\u56fe.png?width=2#preview">\r\n',
+                encoding="utf-8",
+                newline="",
+            )
+            plan = rename_markdown_assets.create_plan(root, output)
+            for entry in plan["assets"]:
+                if entry["old_path"] == "images/a b.png":
+                    entry["new_path"] = "images/renamed space \u56fe.png"
+                elif entry["old_path"] == "images/\u56fe.png":
+                    entry["new_path"] = "images/\u539f\u59cb\u540d\u79f0.png"
+            plan_path = output / "rename-plan.json"
+            self.write_json(plan_path, plan)
+            original_markdown = markdown.read_bytes()
+
+            result = rename_markdown_assets.apply_plan(plan_path)
+
+            journal = json.loads(
+                Path(result["transaction_path"]).read_text(encoding="utf-8")
+            )
+            rewritten = markdown.read_text(encoding="utf-8", newline="")
+            validation_errors = rename_markdown_assets.validate_plan(plan_path)
+            space_exists = space_asset.exists()
+            raw_exists = raw_asset.exists()
+            backup_ops = [
+                operation
+                for operation in journal["operations"]
+                if operation["op"] == "backup-markdown"
+            ]
+            backup_bytes = Path(backup_ops[0]["backup"]).read_bytes()
+
+        self.assertFalse(space_exists)
+        self.assertFalse(raw_exists)
+        self.assertEqual(journal["state"], "committed")
+        self.assertEqual(validation_errors, [])
+        self.assertEqual(backup_bytes, original_markdown)
+        self.assertIn("../images/renamed%20space%20%E5%9B%BE.png", rewritten)
+        self.assertIn(
+            "<../images/renamed%20space%20%E5%9B%BE.png> 'caption'",
+            rewritten,
+        )
+        self.assertIn("../images/\u539f\u59cb\u540d\u79f0.png)", rewritten)
+        self.assertIn(
+            'src="../images/\u539f\u59cb\u540d\u79f0.png?width=2#preview"',
+            rewritten,
+        )
+        self.assertIn('"title"', rewritten)
+        self.assertIn("<details>unchanged</details>", rewritten)
+        self.assertIn("\r\n", rewritten)
+
+    def test_apply_plan_rejects_changed_markdown_before_moving_asset(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, markdown = self.make_markdown_tree(
+                temp_dir,
+                "![plot](images/a.png)\n",
+            )
+            asset = images / "a.png"
+            asset.write_bytes(b"asset")
+            output = root / "plan"
+            rename_markdown_assets.create_plan(root, output)
+            plan_path = output / "rename-plan.json"
+            markdown.write_text(
+                "![plot](images/changed.png)\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(RuntimeError):
+                rename_markdown_assets.apply_plan(plan_path)
+
+            self.assertTrue(asset.exists())
+            self.assertFalse(any(images.glob("*changed*")))
+
+    def test_preflight_plan_rejects_critical_plan_errors(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, _markdown = self.make_markdown_tree(
+                temp_dir,
+                "![plot](images/a.png)\n",
+            )
+            asset = images / "a.png"
+            asset.write_bytes(b"asset")
+            output = root / "plan"
+            clean_plan = rename_markdown_assets.create_plan(root, output)
+            plan_path = output / "rename-plan.json"
+
+            cases = []
+            bad_schema = dict(clean_plan)
+            bad_schema["schema"] = 99
+            cases.append(("schema", bad_schema))
+
+            escaped = json.loads(json.dumps(clean_plan))
+            escaped["assets"][0]["new_path"] = "../escape.png"
+            cases.append(("root", escaped))
+
+            collision = json.loads(json.dumps(clean_plan))
+            target = root / collision["assets"][0]["new_path"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"occupied")
+            cases.append(("collision", collision))
+
+            for label, plan in cases:
+                with self.subTest(label=label):
+                    self.write_json(plan_path, plan)
+                    with self.assertRaises(RuntimeError):
+                        rename_markdown_assets.preflight_plan(plan, plan_path)
+                    if label == "collision":
+                        target.unlink()
+
+            hash_changed = json.loads(json.dumps(clean_plan))
+            asset.write_bytes(b"changed")
+            self.write_json(plan_path, hash_changed)
+            with self.assertRaises(RuntimeError):
+                rename_markdown_assets.preflight_plan(hash_changed, plan_path)
+            asset.write_bytes(b"asset")
+
+            clean_copy = json.loads(json.dumps(clean_plan))
+            asset.unlink()
+            self.write_json(plan_path, clean_copy)
+            with self.assertRaises(RuntimeError):
+                rename_markdown_assets.preflight_plan(clean_copy, plan_path)
+
     def test_create_plan_uses_injected_vision_only_for_generic_assets(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

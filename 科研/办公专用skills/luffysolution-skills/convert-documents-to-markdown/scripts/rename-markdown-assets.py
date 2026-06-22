@@ -13,7 +13,7 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 from urllib import request as urllib_request
 
 
@@ -1784,26 +1784,32 @@ def create_plan(
         new_path = (
             path.parent / record.proposed_name
         ).relative_to(canonical_root).as_posix()
-        references = [
-            {
-                "document": _relative_plan_path(
-                    reference.markdown_path, canonical_root
-                ),
-                "start": reference.start,
-                "end": reference.end,
-                "syntax": reference.syntax,
-            }
-            for reference in sorted(
-                record.references,
-                key=lambda item: (
-                    _relative_plan_path(
-                        item.markdown_path, canonical_root
-                    ).casefold(),
-                    item.start,
-                    item.end,
-                ),
+        references = []
+        for reference in sorted(
+            record.references,
+            key=lambda item: (
+                _relative_plan_path(
+                    item.markdown_path, canonical_root
+                ).casefold(),
+                item.start,
+                item.end,
+            ),
+        ):
+            source_bytes = reference.markdown_path.read_bytes()[
+                reference.start : reference.end
+            ]
+            references.append(
+                {
+                    "document": _relative_plan_path(
+                        reference.markdown_path, canonical_root
+                    ),
+                    "start": reference.start,
+                    "end": reference.end,
+                    "syntax": reference.syntax,
+                    "destination": reference.raw_destination,
+                    "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+                }
             )
-        ]
         entries.append(
             {
                 "old_path": old_path,
@@ -1920,6 +1926,586 @@ def create_plan(
                 )
             )
     return plan
+
+
+def rewrite_markdown_bytes(
+    source: bytes,
+    replacements: list[tuple[int, int, bytes]],
+) -> bytes:
+    normalized = []
+    for start, end, replacement in replacements:
+        if not isinstance(start, int) or not isinstance(end, int):
+            raise ValueError("replacement span offsets must be integers")
+        if start < 0 or end < start or end > len(source):
+            raise ValueError("replacement span is outside source bytes")
+        if not isinstance(replacement, bytes):
+            raise TypeError("replacement value must be bytes")
+        normalized.append((start, end, replacement))
+    normalized.sort(key=lambda item: (item[0], item[1]))
+    previous_end = 0
+    for start, end, _replacement in normalized:
+        if start < previous_end:
+            raise ValueError("replacement spans must not overlap")
+        previous_end = end
+
+    rewritten = source
+    for start, end, replacement in reversed(normalized):
+        rewritten = rewritten[:start] + replacement + rewritten[end:]
+    return rewritten
+
+
+def _path_identity(path: Path) -> str:
+    return path.resolve(strict=False).as_posix().casefold()
+
+
+def _plan_relative_path(
+    root: Path,
+    value: object,
+    field: str,
+    errors: list[str],
+) -> Optional[Path]:
+    if not isinstance(value, str) or not value:
+        errors.append("{} must be a non-empty string".format(field))
+        return None
+    if "\\" in value:
+        errors.append("{} must use '/' separators".format(field))
+        return None
+    candidate = Path(value)
+    if candidate.is_absolute():
+        errors.append("{} must be relative to the plan root".format(field))
+        return None
+    resolved = (root / candidate).resolve(strict=False)
+    if not resolved.is_relative_to(root):
+        errors.append("{} escapes the plan root: {}".format(field, value))
+        return None
+    return resolved
+
+
+def _candidate_plan_roots(plan_path: Path) -> list[Path]:
+    candidates = []
+    current = plan_path.resolve(strict=False).parent
+    while True:
+        candidates.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return candidates
+
+
+def _entry_reference_documents(entry: object) -> list[str]:
+    if not isinstance(entry, dict):
+        return []
+    references = entry.get("references", [])
+    if not isinstance(references, list):
+        return []
+    documents = []
+    for reference in references:
+        if isinstance(reference, dict):
+            document = reference.get("document")
+            if isinstance(document, str):
+                documents.append(document)
+    return documents
+
+
+def _infer_plan_root(plan: dict[str, object], plan_path: Path) -> Path:
+    assets = plan.get("assets", [])
+    if not isinstance(assets, list):
+        return plan_path.resolve(strict=False).parent
+
+    for candidate in _candidate_plan_roots(plan_path):
+        paths_ok = True
+        evidence = False
+        for entry in assets:
+            if not isinstance(entry, dict):
+                paths_ok = False
+                break
+            old_path = entry.get("old_path")
+            if isinstance(old_path, str) and old_path:
+                old_abs = (candidate / Path(old_path)).resolve(strict=False)
+                if not old_abs.is_relative_to(candidate):
+                    paths_ok = False
+                    break
+                if old_abs.parent.exists():
+                    evidence = True
+            for document in _entry_reference_documents(entry):
+                doc_abs = (candidate / Path(document)).resolve(strict=False)
+                if not doc_abs.is_relative_to(candidate):
+                    paths_ok = False
+                    break
+                if doc_abs.exists():
+                    evidence = True
+                else:
+                    paths_ok = False
+                    break
+            if not paths_ok:
+                break
+        if paths_ok and evidence:
+            return candidate
+    parent = plan_path.resolve(strict=False).parent
+    if parent.parent != parent:
+        return parent.parent
+    return parent
+
+
+def _split_raw_destination_suffix(raw_destination: str) -> tuple[str, str]:
+    for position, character in enumerate(raw_destination):
+        if character in "?#" and not _is_escaped(raw_destination, position):
+            return raw_destination[:position], raw_destination[position:]
+    return raw_destination, ""
+
+
+def _relative_markdown_destination(markdown_path: Path, asset_path: Path) -> str:
+    relative = os.path.relpath(
+        asset_path.resolve(strict=False),
+        start=markdown_path.resolve(strict=False).parent,
+    )
+    return relative.replace(os.sep, "/")
+
+
+def _encoded_destination_for_reference(
+    reference: Reference,
+    new_asset_path: Path,
+) -> bytes:
+    relative = _relative_markdown_destination(
+        reference.markdown_path,
+        new_asset_path,
+    )
+    _base, suffix = _split_raw_destination_suffix(reference.raw_destination)
+    if reference.encoding_style == "percent":
+        relative = quote(relative, safe="/.-_~")
+    return (relative + suffix).encode("utf-8")
+
+
+def _reference_span_hash(path: Path, start: int, end: int) -> str:
+    data = path.read_bytes()[start:end]
+    return hashlib.sha256(data).hexdigest()
+
+
+def preflight_plan(
+    plan: dict[str, object],
+    plan_path: Path,
+) -> dict[str, object]:
+    plan_path = Path(plan_path).resolve(strict=False)
+    errors: list[str] = []
+    if not isinstance(plan, dict):
+        raise RuntimeError("plan must be a JSON object")
+    if plan.get("schema") != 1:
+        errors.append("unsupported plan schema")
+    assets = plan.get("assets")
+    if not isinstance(assets, list):
+        errors.append("plan assets must be a list")
+        assets = []
+
+    root = _infer_plan_root(plan, plan_path).resolve(strict=False)
+    if not plan_path.is_relative_to(root):
+        errors.append("plan path is outside inferred root")
+
+    executable_assets = []
+    target_keys: dict[str, str] = {}
+    for asset_index, entry in enumerate(assets):
+        if not isinstance(entry, dict):
+            errors.append("asset entry {} is not an object".format(asset_index))
+            continue
+        old_abs = _plan_relative_path(
+            root,
+            entry.get("old_path"),
+            "assets[{}].old_path".format(asset_index),
+            errors,
+        )
+        new_abs = _plan_relative_path(
+            root,
+            entry.get("new_path"),
+            "assets[{}].new_path".format(asset_index),
+            errors,
+        )
+        sha256 = entry.get("sha256")
+        if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            errors.append("assets[{}].sha256 is invalid".format(asset_index))
+        if old_abs is None or new_abs is None or not isinstance(sha256, str):
+            continue
+        if not old_abs.is_file():
+            errors.append("source asset is missing: {}".format(entry.get("old_path")))
+        else:
+            actual_sha256 = sha256_file(old_abs)
+            if actual_sha256 != sha256:
+                errors.append("source asset hash changed: {}".format(
+                    entry.get("old_path")
+                ))
+        if not new_abs.parent.is_dir():
+            errors.append("target parent is missing: {}".format(
+                entry.get("new_path")
+            ))
+        target_key = _path_identity(new_abs)
+        existing_source_key = _path_identity(old_abs)
+        previous_target = target_keys.get(target_key)
+        if previous_target is not None:
+            errors.append("target path collision: {}".format(entry.get("new_path")))
+        target_keys[target_key] = str(entry.get("new_path"))
+        if new_abs.exists() and target_key != existing_source_key:
+            errors.append("target path already exists: {}".format(
+                entry.get("new_path")
+            ))
+
+        references = entry.get("references", [])
+        if not isinstance(references, list):
+            errors.append("assets[{}].references must be a list".format(asset_index))
+            references = []
+        executable_references = []
+        for reference_index, reference_entry in enumerate(references):
+            prefix = "assets[{}].references[{}]".format(
+                asset_index,
+                reference_index,
+            )
+            if not isinstance(reference_entry, dict):
+                errors.append("{} is not an object".format(prefix))
+                continue
+            document_abs = _plan_relative_path(
+                root,
+                reference_entry.get("document"),
+                "{}.document".format(prefix),
+                errors,
+            )
+            start = reference_entry.get("start")
+            end = reference_entry.get("end")
+            if not isinstance(start, int) or not isinstance(end, int):
+                errors.append("{}.span offsets are invalid".format(prefix))
+                continue
+            if document_abs is None:
+                continue
+            if not document_abs.is_file():
+                errors.append("Markdown document is missing: {}".format(
+                    reference_entry.get("document")
+                ))
+                continue
+            document_bytes = document_abs.read_bytes()
+            if start < 0 or end < start or end > len(document_bytes):
+                errors.append("reference span is outside document: {}".format(
+                    reference_entry.get("document")
+                ))
+                continue
+            expected_hash = reference_entry.get("source_sha256")
+            if isinstance(expected_hash, str):
+                actual_hash = _reference_span_hash(document_abs, start, end)
+                if actual_hash != expected_hash:
+                    errors.append("reference destination span changed: {}".format(
+                        reference_entry.get("document")
+                    ))
+                    continue
+            matching = [
+                reference
+                for reference in scan_markdown(document_abs, root)
+                if (
+                    reference.start == start
+                    and reference.end == end
+                    and _path_identity(reference.asset_path)
+                    == _path_identity(old_abs)
+                )
+            ]
+            if len(matching) != 1:
+                errors.append("reference no longer points to source asset: {}".format(
+                    reference_entry.get("document")
+                ))
+                continue
+            executable_references.append(
+                {
+                    "document": document_abs,
+                    "reference": matching[0],
+                    "replacement": _encoded_destination_for_reference(
+                        matching[0],
+                        new_abs,
+                    ),
+                }
+            )
+        executable_assets.append(
+            {
+                "entry": entry,
+                "old_path": old_abs,
+                "new_path": new_abs,
+                "sha256": sha256,
+                "references": executable_references,
+            }
+        )
+
+    if errors:
+        raise RuntimeError("; ".join(errors))
+    return {
+        "root": root,
+        "plan_path": plan_path,
+        "assets": executable_assets,
+    }
+
+
+def _atomic_replace_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(data).hexdigest()[:12]
+    for index in range(1000):
+        temp_path = path.with_name(
+            ".{}.tmp-{}-{}".format(path.name, digest, index)
+        )
+        try:
+            with temp_path.open("xb") as stream:
+                stream.write(data)
+            os.replace(temp_path, path)
+            return
+        except FileExistsError:
+            continue
+        except Exception:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+            raise
+    raise RuntimeError("unable to create temporary file for {}".format(path))
+
+
+def _atomic_write_json(path: Path, value: dict[str, object]) -> None:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    ).encode("utf-8") + b"\n"
+    _atomic_replace_bytes(path, payload)
+
+
+def _asset_temp_path(asset_path: Path, transaction_id: str, index: int) -> Path:
+    name = ".{}.rename-{}-{}.tmp".format(
+        asset_path.name,
+        transaction_id,
+        index,
+    )
+    return asset_path.with_name(name)
+
+
+def _append_journal_op(
+    journal_path: Path,
+    journal: dict[str, object],
+    operation: dict[str, object],
+) -> None:
+    operations = journal.setdefault("operations", [])
+    assert isinstance(operations, list)
+    operations.append(operation)
+    _atomic_write_json(journal_path, journal)
+
+
+def _load_plan(plan_path: Path) -> dict[str, object]:
+    try:
+        plan = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("unable to read plan") from exc
+    if not isinstance(plan, dict):
+        raise RuntimeError("plan must be a JSON object")
+    return plan
+
+
+def apply_plan(plan_path: Path, fail_after=None) -> dict[str, object]:
+    plan_path = Path(plan_path).resolve(strict=False)
+    plan = _load_plan(plan_path)
+    executable = preflight_plan(plan, plan_path)
+    transaction_id = hashlib.sha256(plan_path.read_bytes()).hexdigest()[:16]
+    transaction_dir = plan_path.parent / ".rename-markdown-assets" / transaction_id
+    transaction_dir.mkdir(parents=True, exist_ok=True)
+    journal_path = transaction_dir / "transaction.json"
+    journal: dict[str, object] = {
+        "schema": 1,
+        "state": "prepared",
+        "plan_path": plan_path.as_posix(),
+        "root": executable["root"].as_posix(),
+        "operations": [],
+    }
+    _atomic_write_json(journal_path, journal)
+
+    moved_assets = []
+    for index, asset in enumerate(executable["assets"]):
+        old_path = asset["old_path"]
+        new_path = asset["new_path"]
+        if _path_identity(old_path) == _path_identity(new_path):
+            continue
+        temp_path = _asset_temp_path(old_path, transaction_id, index)
+        temp_index = index
+        while temp_path.exists():
+            temp_index += len(executable["assets"]) + 1
+            temp_path = _asset_temp_path(old_path, transaction_id, temp_index)
+        os.replace(old_path, temp_path)
+        moved_assets.append((temp_path, new_path))
+        _append_journal_op(
+            journal_path,
+            journal,
+            {
+                "op": "move-asset-to-temp",
+                "from": old_path.as_posix(),
+                "to": temp_path.as_posix(),
+            },
+        )
+        os.replace(temp_path, new_path)
+        _append_journal_op(
+            journal_path,
+            journal,
+            {
+                "op": "move-temp-to-target",
+                "from": temp_path.as_posix(),
+                "to": new_path.as_posix(),
+            },
+        )
+
+    replacements_by_document: dict[Path, list[tuple[int, int, bytes]]] = {}
+    for asset in executable["assets"]:
+        for reference in asset["references"]:
+            markdown_reference = reference["reference"]
+            replacements_by_document.setdefault(
+                reference["document"],
+                [],
+            ).append(
+                (
+                    markdown_reference.start,
+                    markdown_reference.end,
+                    reference["replacement"],
+                )
+            )
+
+    backup_root = transaction_dir / "markdown-backups"
+    root = executable["root"]
+    assert isinstance(root, Path)
+    for document, replacements in sorted(
+        replacements_by_document.items(),
+        key=lambda item: item[0].as_posix().casefold(),
+    ):
+        original = document.read_bytes()
+        relative_document = document.relative_to(root)
+        backup_path = backup_root / relative_document
+        _atomic_replace_bytes(backup_path, original)
+        _append_journal_op(
+            journal_path,
+            journal,
+            {
+                "op": "backup-markdown",
+                "path": document.as_posix(),
+                "backup": backup_path.as_posix(),
+            },
+        )
+        rewritten = rewrite_markdown_bytes(original, replacements)
+        _atomic_replace_bytes(document, rewritten)
+        _append_journal_op(
+            journal_path,
+            journal,
+            {
+                "op": "replace-markdown",
+                "path": document.as_posix(),
+            },
+        )
+
+    validation_errors = validate_plan(plan_path)
+    if validation_errors:
+        journal["state"] = "validation-failed"
+        journal["validation_errors"] = validation_errors
+        _atomic_write_json(journal_path, journal)
+        raise RuntimeError("; ".join(validation_errors))
+
+    journal["state"] = "committed"
+    _atomic_write_json(journal_path, journal)
+    return {
+        "state": "committed",
+        "transaction_path": journal_path.as_posix(),
+    }
+
+
+def _planned_reference_counts(
+    plan: dict[str, object],
+) -> dict[tuple[str, str], int]:
+    counts: dict[tuple[str, str], int] = {}
+    assets = plan.get("assets", [])
+    if not isinstance(assets, list):
+        return counts
+    for entry in assets:
+        if not isinstance(entry, dict):
+            continue
+        new_path = entry.get("new_path")
+        references = entry.get("references", [])
+        if not isinstance(new_path, str) or not isinstance(references, list):
+            continue
+        for reference in references:
+            if not isinstance(reference, dict):
+                continue
+            document = reference.get("document")
+            if isinstance(document, str):
+                key = (document, new_path)
+                counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def validate_plan(plan_path: Path) -> list[str]:
+    plan_path = Path(plan_path).resolve(strict=False)
+    try:
+        plan = _load_plan(plan_path)
+    except RuntimeError as exc:
+        return [str(exc)]
+    errors: list[str] = []
+    if not isinstance(plan, dict) or plan.get("schema") != 1:
+        return ["unsupported plan schema"]
+    root = _infer_plan_root(plan, plan_path).resolve(strict=False)
+    assets = plan.get("assets", [])
+    if not isinstance(assets, list):
+        return ["plan assets must be a list"]
+
+    for entry in assets:
+        if not isinstance(entry, dict):
+            errors.append("asset entry is not an object")
+            continue
+        old_path_text = entry.get("old_path")
+        new_path_text = entry.get("new_path")
+        sha256_text = entry.get("sha256")
+        old_abs = _plan_relative_path(root, old_path_text, "old_path", errors)
+        new_abs = _plan_relative_path(root, new_path_text, "new_path", errors)
+        if new_abs is None or not isinstance(sha256_text, str):
+            continue
+        if not new_abs.is_file():
+            errors.append("target asset is missing: {}".format(new_path_text))
+        elif sha256_file(new_abs) != sha256_text:
+            errors.append("target asset hash mismatch: {}".format(new_path_text))
+        if old_abs is not None and _path_identity(old_abs) != _path_identity(new_abs):
+            if old_abs.exists():
+                errors.append("old asset still exists: {}".format(old_path_text))
+
+    expected_counts = _planned_reference_counts(plan)
+    actual_counts: dict[tuple[str, str], int] = {}
+    documents = sorted({document for document, _new in expected_counts})
+    for document_text in documents:
+        document_abs = _plan_relative_path(
+            root,
+            document_text,
+            "reference.document",
+            errors,
+        )
+        if document_abs is None or not document_abs.is_file():
+            errors.append("Markdown document is missing: {}".format(document_text))
+            continue
+        for reference in scan_markdown(document_abs, root):
+            relative_asset = reference.asset_path.relative_to(root).as_posix()
+            key = (document_text, relative_asset)
+            actual_counts[key] = actual_counts.get(key, 0) + 1
+            for entry in assets:
+                if not isinstance(entry, dict):
+                    continue
+                old_path_text = entry.get("old_path")
+                new_path_text = entry.get("new_path")
+                if (
+                    isinstance(old_path_text, str)
+                    and isinstance(new_path_text, str)
+                    and old_path_text != new_path_text
+                    and relative_asset == old_path_text
+                ):
+                    errors.append("stale old reference remains: {}".format(
+                        old_path_text
+                    ))
+    for key, expected in expected_counts.items():
+        actual = actual_counts.get(key, 0)
+        if actual < expected:
+            errors.append("missing rewritten references for {} in {}".format(
+                key[1],
+                key[0],
+            ))
+    return errors
 
 
 def main(argv=None) -> int:
