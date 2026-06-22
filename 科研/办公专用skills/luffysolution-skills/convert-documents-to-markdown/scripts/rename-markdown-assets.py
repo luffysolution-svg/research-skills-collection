@@ -1,9 +1,12 @@
 import argparse
+import base64
 import csv
 import hashlib
 import html
 import json
 import math
+import mimetypes
+import os
 import re
 import sys
 import unicodedata
@@ -11,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
 from urllib.parse import unquote
+from urllib import request as urllib_request
 
 
 @dataclass(frozen=True)
@@ -47,6 +51,17 @@ SUPPORTED_IMAGE_EXTENSIONS = {
     ".svg",
 }
 
+VISION_ENV = (
+    "MARKITDOWN_OCR_API_KEY",
+    "MARKITDOWN_OCR_BASE_URL",
+    "MARKITDOWN_OCR_MODEL",
+)
+PROMPT_VERSION = "semantic-asset-name-v1"
+DEFAULT_VISION_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_VISION_MODEL = "gpt-4.1-mini"
+VISION_CONFIDENCE_THRESHOLD = 0.65
+CACHE_FILENAME = ".asset-name-cache.json"
+
 
 WINDOWS_RESERVED = {
     "con",
@@ -64,6 +79,218 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _windows_user_env(name: str) -> str:
+    if os.name != "nt":
+        return ""
+    try:
+        import winreg
+    except ImportError:
+        return ""
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            "Environment",
+        ) as key:
+            value, _value_type = winreg.QueryValueEx(key, name)
+    except OSError:
+        return ""
+    return str(value)
+
+
+def _env_value(name: str) -> str:
+    value = os.environ.get(name, "")
+    if value:
+        return value
+    return _windows_user_env(name)
+
+
+def classify_base_url(base_url: str) -> str:
+    normalized = base_url.casefold()
+    if "api.ikuncode.cc" in normalized:
+        return "third-party OpenAI-compatible relay"
+    if "api.openai.com" in normalized:
+        return "official OpenAI API"
+    if normalized:
+        return "OpenAI-compatible endpoint"
+    return "not configured"
+
+
+def load_vision_config() -> dict[str, object]:
+    api_key = _env_value("MARKITDOWN_OCR_API_KEY")
+    base_url = _env_value("MARKITDOWN_OCR_BASE_URL")
+    model = _env_value("MARKITDOWN_OCR_MODEL")
+    base_url = base_url.rstrip("/") or DEFAULT_VISION_BASE_URL
+    model = model or DEFAULT_VISION_MODEL
+    return {
+        "api_key": api_key,
+        "base_url": base_url,
+        "base_url_classification": classify_base_url(base_url),
+        "model": model,
+        "prompt_version": PROMPT_VERSION,
+        "configured": bool(api_key),
+    }
+
+
+def vision_cache_key(
+    sha256: str,
+    model: str,
+    prompt_version: str,
+) -> str:
+    return "sha256={};model={};prompt={}".format(
+        sha256,
+        model,
+        prompt_version,
+    )
+
+
+def _load_vision_cache(output_dir: Path) -> dict[str, object]:
+    cache_path = output_dir / CACHE_FILENAME
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"schema": 1, "entries": {}}
+    if not isinstance(cache, dict):
+        return {"schema": 1, "entries": {}}
+    entries = cache.get("entries")
+    if not isinstance(entries, dict):
+        cache["entries"] = {}
+    cache["schema"] = 1
+    return cache
+
+
+def _write_vision_cache(output_dir: Path, cache: dict[str, object]) -> None:
+    sanitized = {
+        "schema": 1,
+        "entries": cache.get("entries", {}),
+    }
+    cache_path = output_dir / CACHE_FILENAME
+    with cache_path.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write(
+            json.dumps(
+                sanitized,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        stream.write("\n")
+
+
+def _image_data_url(path: Path) -> str:
+    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return "data:{};base64,{}".format(media_type, encoded)
+
+
+def _json_response_content(response: dict[str, object]) -> object:
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ValueError("vision response missing choices")
+    first = choices[0]
+    if not isinstance(first, dict):
+        raise ValueError("vision response choice is not an object")
+    message = first.get("message")
+    if not isinstance(message, dict):
+        raise ValueError("vision response missing message")
+    if "parsed" in message:
+        return message["parsed"]
+    content = message.get("content")
+    if not isinstance(content, str):
+        raise ValueError("vision response content is not text")
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError("vision response content is not JSON") from exc
+
+
+def _validate_vision_result(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("vision result is not an object")
+    description = value.get("description")
+    keywords = value.get("keywords", [])
+    confidence = value.get("confidence")
+    if not isinstance(description, str) or not description.strip():
+        raise ValueError("vision result missing description")
+    if not isinstance(keywords, list):
+        raise ValueError("vision result keywords must be a list")
+    cleaned_keywords = [
+        str(keyword).strip()
+        for keyword in keywords
+        if str(keyword).strip()
+    ]
+    if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+        raise ValueError("vision result confidence must be numeric")
+    return {
+        "description": re.sub(r"\s+", " ", description).strip(),
+        "keywords": cleaned_keywords,
+        "confidence": float(confidence),
+    }
+
+
+def analyze_image_with_vision(
+    path: Path,
+    context: dict[str, object],
+    config: dict[str, object],
+) -> dict[str, object]:
+    api_key = str(config.get("api_key") or "")
+    if not api_key:
+        raise RuntimeError("MARKITDOWN_OCR_API_KEY is not configured")
+    base_url = str(config.get("base_url") or DEFAULT_VISION_BASE_URL).rstrip("/")
+    model = str(config.get("model") or DEFAULT_VISION_MODEL)
+    endpoint = "{}/chat/completions".format(base_url)
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Describe the supplied Markdown image for a stable, "
+                    "semantic file name. Return only JSON with description, "
+                    "keywords, and confidence."
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "prompt_version": PROMPT_VERSION,
+                                "context": context,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": _image_data_url(path),
+                        },
+                    },
+                ],
+            },
+        ],
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    http_request = urllib_request.Request(
+        endpoint,
+        data=body,
+        headers={
+            "Authorization": "Bearer {}".format(api_key),
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib_request.urlopen(http_request, timeout=60) as response:
+        raw_response = response.read().decode("utf-8")
+    parsed_response = json.loads(raw_response)
+    return _validate_vision_result(_json_response_content(parsed_response))
 
 
 def slugify(value: str) -> str:
@@ -1123,6 +1350,8 @@ def choose_evidence(
             visual_type = _normalized_visual_type(
                 str(item.get("visual_type", "image")), caption
             )
+            if item.get("source") == "vision":
+                return visual_type, caption, "vision"
             return visual_type, caption, "mineru-caption"
 
     contexts = [
@@ -1302,17 +1531,178 @@ def _relative_plan_path(path: Path, root: Path) -> str:
     return path.resolve(strict=False).relative_to(root).as_posix()
 
 
+def _vision_context(record: AssetRecord, root: Path) -> dict[str, object]:
+    references = []
+    for reference in sorted(
+        record.references,
+        key=lambda item: (
+            item.markdown_path.relative_to(root).as_posix().casefold(),
+            item.start,
+            item.end,
+        ),
+    ):
+        references.append(
+            {
+                "document": reference.markdown_path.relative_to(root).as_posix(),
+                "syntax": reference.syntax,
+                "context": markdown_context(reference),
+            }
+        )
+    return {
+        "asset_path": record.path.relative_to(root).as_posix(),
+        "original_name": record.path.name,
+        "references": references,
+    }
+
+
+def _is_generic_vision_description(description: str) -> bool:
+    slug = slugify(description)
+    return slug in {
+        "",
+        "asset",
+        "figure",
+        "graphic",
+        "image",
+        "photo",
+        "picture",
+        "screenshot",
+    }
+
+
+def _vision_status_for_result(result: dict[str, object]) -> str:
+    confidence = float(result.get("confidence", 0.0))
+    description = str(result.get("description", ""))
+    if confidence < VISION_CONFIDENCE_THRESHOLD:
+        return "rejected"
+    if _is_generic_vision_description(description):
+        return "rejected"
+    return "used"
+
+
+def _vision_metadata(config: dict[str, object]) -> dict[str, object]:
+    return {
+        "vision": {
+            "base_url_classification": config["base_url_classification"],
+            "configured": bool(config["configured"]),
+            "model": config["model"],
+            "prompt_version": PROMPT_VERSION,
+        }
+    }
+
+
+def _apply_optional_vision(
+    root: Path,
+    output_dir: Path,
+    assets: dict[Path, AssetRecord],
+    metadata: dict[Path, list[dict[str, object]]],
+    vision_analyzer,
+) -> tuple[dict[Path, str], dict[str, object], int]:
+    config = load_vision_config()
+    analyzer = vision_analyzer or analyze_image_with_vision
+    cache = _load_vision_cache(output_dir)
+    entries = cache["entries"]
+    assert isinstance(entries, dict)
+    status_by_path: dict[Path, str] = {}
+    processed = 0
+
+    for record in sorted(
+        assets.values(),
+        key=lambda item: _reference_sort_key(root, item),
+    ):
+        _visual_type, _semantic_text, reason = choose_evidence(
+            record, metadata
+        )
+        if reason != "generic-fallback":
+            continue
+        processed += 1
+        key = vision_cache_key(
+            record.sha256,
+            str(config["model"]),
+            PROMPT_VERSION,
+        )
+        cached = entries.get(key)
+        if isinstance(cached, dict):
+            result = cached.get("result")
+            try:
+                validated = _validate_vision_result(result)
+            except ValueError:
+                validated = None
+            if validated is not None:
+                status = _vision_status_for_result(validated)
+                status_by_path[record.path] = status
+                if status == "used":
+                    record.evidence = [
+                        {
+                            "caption": validated["description"],
+                            "visual_type": "image",
+                            "source": "vision",
+                        }
+                    ]
+                continue
+        try:
+            result = _validate_vision_result(
+                analyzer(record.path, _vision_context(record, root), config)
+            )
+        except Exception:
+            status_by_path[record.path] = "failed"
+            continue
+        status = _vision_status_for_result(result)
+        status_by_path[record.path] = status
+        entries[key] = {
+            "prompt_version": PROMPT_VERSION,
+            "model": config["model"],
+            "sha256": record.sha256,
+            "result": result,
+        }
+        if status == "used":
+            record.evidence = [
+                {
+                    "caption": result["description"],
+                    "visual_type": "image",
+                    "source": "vision",
+                }
+            ]
+
+    _write_vision_cache(output_dir, cache)
+    return status_by_path, config, processed
+
+
+def check_vision() -> int:
+    config = load_vision_config()
+    status = {
+        "api_key_configured": bool(config["configured"]),
+        "base_url_classification": config["base_url_classification"],
+        "model": config["model"],
+        "prompt_version": PROMPT_VERSION,
+    }
+    print(json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
 def create_plan(
     root: Path,
     output_dir: Path,
     use_vision: bool = False,
     vision_analyzer=None,
 ) -> dict[str, object]:
-    del use_vision, vision_analyzer
     canonical_root = root.resolve(strict=False)
     output_dir = output_dir.resolve(strict=False)
     documents, assets, warnings = build_asset_graph(canonical_root)
     metadata = load_mineru_metadata(canonical_root)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    vision_status_by_path: dict[Path, str] = {}
+    vision_config = None
+    vision_calls = 0
+    if use_vision:
+        vision_status_by_path, vision_config, vision_calls = (
+            _apply_optional_vision(
+                canonical_root,
+                output_dir,
+                assets,
+                metadata,
+                vision_analyzer,
+            )
+        )
     named_assets = propose_names(canonical_root, assets, metadata)
 
     entries = []
@@ -1349,9 +1739,14 @@ def create_plan(
                 "reason": record.reason,
                 "references": references,
                 "vision_status": (
-                    "needed"
-                    if record.reason == "generic-fallback"
-                    else "not-needed"
+                    vision_status_by_path.get(
+                        path,
+                        (
+                            "needed"
+                            if record.reason == "generic-fallback"
+                            else "not-needed"
+                        ),
+                    )
                 ),
             }
         )
@@ -1390,6 +1785,8 @@ def create_plan(
         entry["vision_status"] == "needed"
         for entry in entries
     )
+    if use_vision:
+        vision_needed = len(vision_status_by_path)
     plan = {
         "schema": 1,
         "assets": entries,
@@ -1400,13 +1797,14 @@ def create_plan(
             "missing_assets": missing_count,
             "unreferenced_assets": unreferenced_count,
             "vision_needed_assets": vision_needed,
-            "vision_calls": 0,
+            "vision_calls": vision_calls,
             "warnings": len(normalized_warnings),
         },
         "warnings": normalized_warnings,
     }
+    if use_vision and vision_config is not None:
+        plan["metadata"] = _vision_metadata(vision_config)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / "rename-plan.json"
     with json_path.open("w", encoding="utf-8", newline="\n") as stream:
         stream.write(
@@ -1455,7 +1853,14 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Safely rename referenced Markdown assets."
     )
-    parser.parse_args(argv)
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser(
+        "check-vision",
+        help="Show optional vision configuration without revealing secrets.",
+    )
+    args = parser.parse_args(argv)
+    if args.command == "check-vision":
+        return check_vision()
     return 0
 
 

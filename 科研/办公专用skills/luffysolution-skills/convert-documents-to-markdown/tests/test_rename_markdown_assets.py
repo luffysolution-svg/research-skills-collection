@@ -1917,6 +1917,264 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
             },
         )
 
+    def test_create_plan_uses_injected_vision_only_for_generic_assets(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            docs = root / "docs"
+            images = root / "images"
+            output = root / "plan"
+            docs.mkdir()
+            images.mkdir()
+            generic = images / "generic.png"
+            context = images / "context.png"
+            mineru = images / "mineru.png"
+            generic.write_bytes(b"generic")
+            context.write_bytes(b"context")
+            mineru.write_bytes(b"mineru")
+            (docs / "generic.md").write_text(
+                "![](../images/generic.png)\n",
+                encoding="utf-8",
+            )
+            (docs / "context.md").write_text(
+                "![Outlet temperature trend](../images/context.png)\n",
+                encoding="utf-8",
+            )
+            (docs / "mineru.md").write_text(
+                "![](../images/mineru.png)\n",
+                encoding="utf-8",
+            )
+            self.write_json(
+                root / "content_list.json",
+                [
+                    {
+                        "img_path": "images/mineru.png",
+                        "caption": "Figure 9. Reactor pressure profile.",
+                    }
+                ],
+            )
+            calls = []
+
+            def fake_vision(path, context_data, config):
+                calls.append((path.name, context_data, config))
+                return {
+                    "description": "distillation column schematic",
+                    "keywords": ["distillation", "column", "schematic"],
+                    "confidence": 0.93,
+                }
+
+            plan = rename_markdown_assets.create_plan(
+                root,
+                output,
+                use_vision=True,
+                vision_analyzer=fake_vision,
+            )
+
+        self.assertEqual([name for name, _context, _config in calls],
+                         ["generic.png"])
+        by_old_path = {
+            entry["old_path"]: entry
+            for entry in plan["assets"]
+        }
+        generic_entry = by_old_path["images/generic.png"]
+        self.assertEqual(generic_entry["vision_status"], "used")
+        self.assertIn(
+            "distillation-column-schematic",
+            generic_entry["new_path"],
+        )
+        self.assertEqual(
+            by_old_path["images/context.png"]["vision_status"],
+            "not-needed",
+        )
+        self.assertEqual(
+            by_old_path["images/mineru.png"]["vision_status"],
+            "not-needed",
+        )
+        self.assertEqual(plan["summary"]["vision_needed_assets"], 1)
+        self.assertEqual(plan["summary"]["vision_calls"], 1)
+        self.assertEqual(
+            plan["metadata"]["vision"]["prompt_version"],
+            rename_markdown_assets.PROMPT_VERSION,
+        )
+        self.assertNotIn(
+            "api_key",
+            json.dumps(plan["metadata"], sort_keys=True).casefold(),
+        )
+
+    def test_create_plan_rejects_low_confidence_and_generic_vision(self):
+        cases = [
+            (
+                {
+                    "description": "packed bed reactor cross section",
+                    "keywords": ["reactor"],
+                    "confidence": 0.49,
+                },
+                "rejected",
+            ),
+            (
+                {
+                    "description": "image",
+                    "keywords": ["image"],
+                    "confidence": 0.98,
+                },
+                "rejected",
+            ),
+        ]
+        for response, expected_status in cases:
+            with self.subTest(response=response):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root, images, _markdown_path = self.make_markdown_tree(
+                        temp_dir,
+                        "![](images/a.png)\n",
+                    )
+                    asset = images / "a.png"
+                    asset.write_bytes(b"generic")
+                    output = root / "plan"
+
+                    plan = rename_markdown_assets.create_plan(
+                        root,
+                        output,
+                        use_vision=True,
+                        vision_analyzer=lambda _path, _context, _config: (
+                            response
+                        ),
+                    )
+
+                entry = plan["assets"][0]
+                self.assertEqual(entry["vision_status"], expected_status)
+                self.assertEqual(entry["reason"], "generic-fallback")
+                self.assertIn("-" + entry["sha256"][:8], entry["new_path"])
+                self.assertIn("asset", entry["new_path"])
+
+    def test_create_plan_marks_vision_failure_and_keeps_stable_fallback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, _markdown_path = self.make_markdown_tree(
+                temp_dir,
+                "![](images/a.png)\n",
+            )
+            asset = images / "a.png"
+            asset.write_bytes(b"generic")
+            output = root / "plan"
+
+            def unavailable(_path, _context, _config):
+                raise RuntimeError("provider unavailable")
+
+            first = rename_markdown_assets.create_plan(
+                root,
+                output,
+                use_vision=True,
+                vision_analyzer=unavailable,
+            )
+            second = rename_markdown_assets.create_plan(
+                root,
+                output,
+                use_vision=True,
+                vision_analyzer=unavailable,
+            )
+
+        self.assertEqual(first, second)
+        entry = first["assets"][0]
+        self.assertEqual(entry["vision_status"], "failed")
+        self.assertEqual(entry["reason"], "generic-fallback")
+        self.assertIn("-" + entry["sha256"][:8], entry["new_path"])
+
+    def test_vision_cache_key_is_deterministic_and_includes_inputs(self):
+        first = rename_markdown_assets.vision_cache_key(
+            "a" * 64,
+            "gpt-4.1-mini",
+            "semantic-asset-name-v1",
+        )
+        second = rename_markdown_assets.vision_cache_key(
+            "a" * 64,
+            "gpt-4.1-mini",
+            "semantic-asset-name-v1",
+        )
+        changed = rename_markdown_assets.vision_cache_key(
+            "b" * 64,
+            "gpt-4.1-mini",
+            "semantic-asset-name-v1",
+        )
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, changed)
+        self.assertIn("a" * 64, first)
+        self.assertIn("gpt-4.1-mini", first)
+        self.assertIn("semantic-asset-name-v1", first)
+
+    def test_vision_cache_is_written_without_key_and_reused(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, _markdown_path = self.make_markdown_tree(
+                temp_dir,
+                "![](images/a.png)\n",
+            )
+            asset = images / "a.png"
+            asset.write_bytes(b"generic")
+            output = root / "plan"
+            calls = []
+
+            def fake_vision(path, _context, _config):
+                calls.append(path.name)
+                return {
+                    "description": "absorber tower diagram",
+                    "keywords": ["absorber", "tower"],
+                    "confidence": 0.91,
+                }
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "MARKITDOWN_OCR_API_KEY": "secret-test-key",
+                    "MARKITDOWN_OCR_BASE_URL": "https://api.ikuncode.cc/v1",
+                    "MARKITDOWN_OCR_MODEL": "vision-test-model",
+                },
+            ):
+                first = rename_markdown_assets.create_plan(
+                    root,
+                    output,
+                    use_vision=True,
+                    vision_analyzer=fake_vision,
+                )
+                second = rename_markdown_assets.create_plan(
+                    root,
+                    output,
+                    use_vision=True,
+                    vision_analyzer=fake_vision,
+                )
+            cache_text = (output / ".asset-name-cache.json").read_text(
+                encoding="utf-8"
+            )
+
+        self.assertEqual(calls, ["a.png"])
+        self.assertEqual(first, second)
+        self.assertIn("absorber-tower-diagram", first["assets"][0]["new_path"])
+        self.assertNotIn("secret-test-key", cache_text)
+        self.assertEqual(
+            first["metadata"]["vision"]["base_url_classification"],
+            "third-party OpenAI-compatible relay",
+        )
+        self.assertEqual(
+            first["metadata"]["vision"]["model"],
+            "vision-test-model",
+        )
+
+    def test_create_plan_without_vision_does_not_load_vision_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, _markdown_path = self.make_markdown_tree(
+                temp_dir,
+                "![](images/a.png)\n",
+            )
+            (images / "a.png").write_bytes(b"generic")
+            with patch.object(
+                rename_markdown_assets,
+                "load_vision_config",
+                side_effect=AssertionError("vision config loaded"),
+            ):
+                plan = rename_markdown_assets.create_plan(
+                    root,
+                    root / "plan",
+                )
+
+        self.assertNotIn("metadata", plan)
+
 
 if __name__ == "__main__":
     unittest.main()
