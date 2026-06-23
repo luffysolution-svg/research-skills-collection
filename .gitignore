@@ -33,5 +33,8 @@ coverage/
 # Local source mirrors are intentionally excluded
 _sources/
 
+# Local skill tests may contain machine-specific fixture paths
+/科研/办公专用skills/luffysolution-skills/convert-documents-to-markdown/tests/
+
 # Isolated feature worktrees
 .worktrees/
