@@ -59,8 +59,15 @@ class RealMinerUFixtureTests(unittest.TestCase):
             ]
 
             self.assertEqual(plan["summary"]["documents"], 4)
-            self.assertEqual(plan["summary"]["eligible_assets"], 47)
+            self.assertEqual(plan["summary"]["eligible_assets"], 16)
             self.assertEqual(plan["summary"]["unreferenced_assets"], 94)
+            self.assertEqual(
+                sum(
+                    warning["code"] == "low-evidence-context-asset"
+                    for warning in plan["warnings"]
+                ),
+                31,
+            )
             self.assertTrue(matching_names, json.dumps(
                 plan["assets"],
                 ensure_ascii=False,

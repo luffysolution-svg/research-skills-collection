@@ -63,6 +63,13 @@ VISION_CONFIDENCE_THRESHOLD = 0.65
 CACHE_FILENAME = ".asset-name-cache.json"
 MAX_VISION_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_VISION_RESPONSE_BYTES = 1024 * 1024
+LOW_EVIDENCE_SMALL_ASSET_BYTES = 8 * 1024
+LOW_EVIDENCE_SMALL_ASSET_MAX_EDGE = 160
+LOW_EVIDENCE_REASONS = {
+    "markdown-heading",
+    "markdown-paragraph",
+    "generic-fallback",
+}
 
 
 class VisionAnalysisError(RuntimeError):
@@ -1329,6 +1336,84 @@ def _paragraph_blocks(text: str) -> list[tuple[int, int, str]]:
     return blocks
 
 
+def _is_caption_line(line: str) -> bool:
+    return re.match(
+        r"^[ \t]*(?:Figure|Fig\.?|鍥緗Table|琛▅Chart)\s*\d*"
+        r"\s*[\.:锛氥€?]?\s*\S.*$",
+        line,
+        re.IGNORECASE,
+    ) is not None
+
+
+def _contains_image_syntax(line: str) -> bool:
+    return re.search(
+        r"!\[[^\]]*\]\([^)]*\)|<img\b", line, re.IGNORECASE
+    ) is not None
+
+
+def _adjacent_caption(text: str, character_offset: int) -> str:
+    lines = []
+    position = 0
+    for line in text.splitlines(keepends=True):
+        line_end = position + len(line)
+        lines.append((position, line_end, line.rstrip("\r\n")))
+        position = line_end
+    if not lines:
+        return ""
+
+    reference_line = 0
+    for index, (start, end, _line) in enumerate(lines):
+        if start <= character_offset <= end:
+            reference_line = index
+            break
+
+    for index in (reference_line + 1, reference_line - 1):
+        if index < 0 or index >= len(lines):
+            continue
+        line = lines[index][2]
+        stripped = line.strip()
+        if (
+            not stripped
+            or stripped.startswith("#")
+            or _contains_image_syntax(line)
+        ):
+            continue
+        if _is_caption_line(line):
+            return _clean_markdown_text(line)
+    candidates = []
+    for match in re.finditer(
+        r"(?m)^[ \t]*(?:Figure|Fig\.?|鍥緗Table|琛▅Chart)\s*\d*"
+        r"\s*[\.:锛氥€?]?\s*\S.*$",
+        text,
+        re.IGNORECASE,
+    ):
+        distance = min(
+            abs(match.start() - character_offset),
+            abs(match.end() - character_offset),
+        )
+        if distance > 500:
+            continue
+        between = text[
+            min(character_offset, match.start()):
+            max(character_offset, match.end())
+        ]
+        if _contains_image_syntax(between):
+            continue
+        if re.search(
+            r"(?m)^[ \t]{0,3}#{1,6}[ \t]+",
+            between,
+        ):
+            continue
+        candidates.append((
+            distance,
+            match.start(),
+            _clean_markdown_text(match.group()),
+        ))
+    if candidates:
+        return min(candidates)[2]
+    return ""
+
+
 def markdown_context(reference: Reference) -> dict[str, str]:
     encoded = reference.markdown_path.read_bytes()
     text = encoded.decode("utf-8")
@@ -1346,7 +1431,7 @@ def markdown_context(reference: Reference) -> dict[str, str]:
         )
         if distance <= 500:
             captions.append((distance, match.start(), _clean_markdown_text(match.group())))
-    nearby_caption = min(captions)[2] if captions else ""
+    nearby_caption = _adjacent_caption(text, character_offset)
 
     headings = [
         (match.start(), _clean_markdown_text(match.group(1)))
@@ -1403,6 +1488,91 @@ def _normalized_visual_type(value: str, semantic_text: str) -> str:
     if "chart" in normalized or "plot" in normalized or "graph" in normalized:
         return "chart"
     return "figure"
+
+
+def _jpeg_dimensions(data: bytes) -> Optional[tuple[int, int]]:
+    if not data.startswith(b"\xff\xd8"):
+        return None
+    index = 2
+    while index + 9 < len(data):
+        if data[index] != 0xFF:
+            index += 1
+            continue
+        while index < len(data) and data[index] == 0xFF:
+            index += 1
+        if index >= len(data):
+            return None
+        marker = data[index]
+        index += 1
+        if marker in {0xD8, 0xD9}:
+            continue
+        if index + 2 > len(data):
+            return None
+        length = int.from_bytes(data[index:index + 2], "big")
+        if length < 2 or index + length > len(data):
+            return None
+        if marker in {
+            0xC0,
+            0xC1,
+            0xC2,
+            0xC3,
+            0xC5,
+            0xC6,
+            0xC7,
+            0xC9,
+            0xCA,
+            0xCB,
+            0xCD,
+            0xCE,
+            0xCF,
+        }:
+            if length < 7:
+                return None
+            height = int.from_bytes(data[index + 3:index + 5], "big")
+            width = int.from_bytes(data[index + 5:index + 7], "big")
+            return width, height
+        index += length
+    return None
+
+
+def _image_dimensions(path: Path) -> Optional[tuple[int, int]]:
+    try:
+        data = path.read_bytes()[:4096]
+    except OSError:
+        return None
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        return (
+            int.from_bytes(data[16:20], "big"),
+            int.from_bytes(data[20:24], "big"),
+        )
+    if data.startswith((b"GIF87a", b"GIF89a")) and len(data) >= 10:
+        return (
+            int.from_bytes(data[6:8], "little"),
+            int.from_bytes(data[8:10], "little"),
+        )
+    return _jpeg_dimensions(data)
+
+
+def _skip_warning_for_low_evidence_asset(
+    record: AssetRecord, reason: str
+) -> str:
+    if reason in {"markdown-heading", "markdown-paragraph"}:
+        return "low-evidence-context-asset"
+    if reason != "generic-fallback":
+        return ""
+    try:
+        byte_size = record.path.stat().st_size
+    except OSError:
+        return ""
+    if byte_size > LOW_EVIDENCE_SMALL_ASSET_BYTES:
+        return ""
+    dimensions = _image_dimensions(record.path)
+    if dimensions is None:
+        return ""
+    width, height = dimensions
+    if max(width, height) <= LOW_EVIDENCE_SMALL_ASSET_MAX_EDGE:
+        return "low-evidence-small-asset"
+    return ""
 
 
 def choose_evidence(
@@ -1557,6 +1727,8 @@ def propose_names(
 
     for record in ordered_records:
         visual_type, semantic_text, reason = choose_evidence(record, metadata)
+        if _skip_warning_for_low_evidence_asset(record, reason):
+            continue
         prefix, explicit_number, semantic_text = _caption_parts(
             visual_type, semantic_text
         )
@@ -1823,6 +1995,26 @@ def create_plan(
             )
         )
     named_assets = propose_names(canonical_root, assets, metadata)
+    skipped_assets = []
+    for path, record in assets.items():
+        if path in named_assets:
+            continue
+        _visual_type, _semantic_text, reason = choose_evidence(
+            record, metadata
+        )
+        warning_code = _skip_warning_for_low_evidence_asset(record, reason)
+        if warning_code:
+            skipped_assets.append(path)
+    for path in skipped_assets:
+        warnings.append(
+            {
+                "code": _skip_warning_for_low_evidence_asset(
+                    assets[path],
+                    choose_evidence(assets[path], metadata)[2],
+                ),
+                "path": str(path),
+            }
+        )
 
     entries = []
     for path, record in named_assets.items():

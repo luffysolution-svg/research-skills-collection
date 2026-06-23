@@ -1681,6 +1681,44 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
 
                 self.assertEqual(selected, expected)
 
+    def test_create_plan_skips_small_uncaptioned_heading_only_assets(self):
+        def png_header(width, height):
+            return (
+                b"\x89PNG\r\n\x1a\n"
+                b"\x00\x00\x00\rIHDR"
+                + width.to_bytes(4, "big")
+                + height.to_bytes(4, "big")
+                + b"\x08\x02\x00\x00\x00"
+            )
+
+        markdown = (
+            "# Journal Article Title\n\n"
+            "![](images/crossmark.png)\n\n"
+            "## Results\n\n"
+            "![](images/reactor.png)\n"
+            "Figure 1. Reactor temperature profile.\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, images, _markdown_path = self.make_markdown_tree(
+                temp_dir, markdown
+            )
+            (images / "crossmark.png").write_bytes(
+                png_header(57, 62) + b"logo"
+            )
+            (images / "reactor.png").write_bytes(
+                png_header(632, 682) + b"diagram"
+            )
+
+            plan = rename_markdown_assets.create_plan(root, root / "plan")
+
+        old_paths = {entry["old_path"] for entry in plan["assets"]}
+        warning_codes = {warning["code"] for warning in plan["warnings"]}
+        self.assertNotIn("docs/images/crossmark.png", old_paths)
+        self.assertIn("docs/images/reactor.png", old_paths)
+        self.assertIn("low-evidence-context-asset", warning_codes)
+        self.assertEqual(plan["summary"]["unique_references"], 2)
+        self.assertEqual(plan["summary"]["eligible_assets"], 1)
+
     def test_markdown_context_extracts_reference_style_alt_text(self):
         markdown = (
             "# Results\n\n"
