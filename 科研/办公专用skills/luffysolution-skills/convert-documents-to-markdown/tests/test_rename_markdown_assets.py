@@ -10,7 +10,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 
-SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "rename-markdown-assets.py"
+SKILL_ROOT = Path(__file__).parents[1]
+SCRIPT_PATH = SKILL_ROOT / "scripts" / "rename-markdown-assets.py"
 SPEC = importlib.util.spec_from_file_location("rename_markdown_assets", SCRIPT_PATH)
 rename_markdown_assets = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(rename_markdown_assets)
@@ -3127,6 +3128,22 @@ class RenameMarkdownAssetsTests(unittest.TestCase):
                 )
 
         self.assertNotIn("metadata", plan)
+
+    def test_skill_documents_preview_apply_validate_and_rollback(self):
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        reference = (SKILL_ROOT / "references" / "engines.md").read_text(
+            encoding="utf-8"
+        )
+        documented = skill + reference
+        for term in (
+            "rename-markdown-assets.py plan",
+            "rename-markdown-assets.py apply",
+            "rename-markdown-assets.py validate",
+            "rename-markdown-assets.py rollback",
+        ):
+            self.assertIn(term, documented)
+        self.assertIn("Do not rename unreferenced assets by default", skill)
+        self.assertIn("explicit confirmation", skill)
 
 
 if __name__ == "__main__":

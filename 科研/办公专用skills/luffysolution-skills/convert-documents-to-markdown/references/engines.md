@@ -40,6 +40,49 @@ python scripts/task-workspace.py cleanup "/path/returned/by/create"
 
 The cleanup command refuses paths outside the system temporary directory, paths without the dedicated prefix, symbolic-link workspaces, and directories without a matching marker. Do not place final Markdown or referenced MinerU assets in this workspace. If MinerU creates an asset directory referenced by Markdown, keep the Markdown and asset directory together as final output.
 
+## Semantic Markdown asset renaming
+
+Use the semantic asset renamer after MinerU or MarkItDown has produced Markdown with referenced local images. The default command is read-only and writes a preview plan plus CSV mapping:
+
+```bash
+python scripts/rename-markdown-assets.py plan "/path/to/markdown-root" --output-dir "/path/to/asset-plan"
+python scripts/rename-markdown-assets.py plan "/path/to/markdown-root" --output-dir "/path/to/asset-plan" --json
+```
+
+The plan output directory contains `rename-plan.json` for automation and `rename-plan.csv` for review in spreadsheet tools. The plan includes document counts, unique references, eligible assets, missing assets, unreferenced assets, vision-needed assets, warnings, old paths, proposed new paths, SHA-256 hashes, evidence reasons, and vision status.
+
+Apply only after reviewing the mapping and receiving explicit user confirmation:
+
+```bash
+python scripts/rename-markdown-assets.py apply "/path/to/asset-plan/rename-plan.json"
+python scripts/rename-markdown-assets.py apply "/path/to/asset-plan/rename-plan.json" --json
+```
+
+Then validate the applied tree:
+
+```bash
+python scripts/rename-markdown-assets.py validate "/path/to/asset-plan/rename-plan.json"
+python scripts/rename-markdown-assets.py validate "/path/to/asset-plan/rename-plan.json" --json
+```
+
+Each apply writes a transaction journal next to the plan. Keep that path in the final report. Roll back with:
+
+```bash
+python scripts/rename-markdown-assets.py rollback "/path/to/asset-plan/transactions/<transaction-id>/transaction.json"
+python scripts/rename-markdown-assets.py rollback "/path/to/asset-plan/transactions/<transaction-id>/transaction.json" --json
+```
+
+Use vision fallback only when deterministic captions, alt text, headings, and nearby paragraphs are insufficient and the user approves API use:
+
+```bash
+python scripts/rename-markdown-assets.py check-vision --json
+python scripts/rename-markdown-assets.py plan "/path/to/markdown-root" --output-dir "/path/to/asset-plan" --vision --json
+```
+
+Vision uses the same OpenAI-compatible environment variables as MarkItDown OCR. Never print or store API keys. For this machine, `https://api.ikuncode.cc/` is a third-party relay, not an official OpenAI endpoint.
+
+Do not rename unreferenced assets by default. Treat unreferenced assets as review warnings unless the user asks for a separate cleanup pass. For tests or real-fixture regressions, copy the Markdown tree into a temporary directory first and run plan, apply, validate, and rollback only on that copy.
+
 ## MarkItDown
 
 Check:

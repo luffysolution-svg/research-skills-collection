@@ -1,6 +1,6 @@
 ---
 name: convert-documents-to-markdown
-description: Use when the user asks to convert, parse, extract, OCR, or batch-process PDF, image, DOCX, PPTX, XLSX, HTML, or other documents into Markdown using MarkItDown, markidown, MarkItDown OCR, or MinerU.
+description: Use when the user asks to convert, parse, extract, OCR, batch-process, or organize PDF, image, DOCX, PPTX, XLSX, HTML, or other document outputs into Markdown, including renaming MinerU hash-named images and updating Markdown asset references.
 ---
 
 # Convert Documents to Markdown
@@ -49,6 +49,22 @@ Run `python scripts/document-tools-doctor.py` before the first conversion in a s
 - Delete only the workspace created for the current task. Never delete input files, final outputs, shared output directories, caches owned by another tool, or an unmarked directory.
 - If cleanup validation fails, leave the directory untouched and report its path for manual review.
 - If the user requests intermediate files, preserve the workspace and report its path.
+
+## Semantic asset renaming
+
+Use `scripts/rename-markdown-assets.py` when the user asks to organize or rename referenced Markdown assets, especially MinerU hash-named image files.
+
+1. Run `python scripts/rename-markdown-assets.py plan "<markdown-root>" --output-dir "<plan-dir>"`.
+2. Report the mapping path, counts, missing assets, unreferenced assets, and warnings from the plan.
+3. Obtain explicit confirmation before mutating files.
+4. Run `python scripts/rename-markdown-assets.py apply "<plan-dir>/rename-plan.json"`.
+5. Run `python scripts/rename-markdown-assets.py validate "<plan-dir>/rename-plan.json"`.
+6. Retain and report the transaction path so `python scripts/rename-markdown-assets.py rollback "<transaction.json>"` can restore the original names and Markdown references if needed.
+
+- Do not rename unreferenced assets by default.
+- Do not use `--vision` unless the user requests it, or deterministic evidence is insufficient and the user approves API use.
+- Treat `https://api.ikuncode.cc/` as a third-party OpenAI-compatible relay, not an official OpenAI endpoint.
+- Operate on a temporary copy for tests and regressions; never mutate user fixture directories such as shared MinerU output when validating behavior.
 
 ## Routing constraints
 
