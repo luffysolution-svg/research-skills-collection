@@ -229,7 +229,7 @@ Unit tests cover:
 Integration tests use a synthetic fixture tree and a copied subset of:
 
 ```text
-F:\化工设计比赛\华南赛区-华南农业大学-凭苯事吃饭\4-动力学来源说明\参考文献\markdown
+<local-real-fixture-markdown-dir>
 ```
 
 The current real-world fixture contains 4 Markdown files, 47 unique referenced images, 141 image files, and 94 unreferenced image candidates. Tests must operate on a temporary copy and confirm:

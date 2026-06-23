@@ -121,8 +121,6 @@ def _env_value(name: str) -> str:
 
 def classify_base_url(base_url: str) -> str:
     normalized = base_url.casefold()
-    if "api.ikuncode.cc" in normalized:
-        return "third-party OpenAI-compatible relay"
     if "api.openai.com" in normalized:
         return "official OpenAI API"
     if normalized:

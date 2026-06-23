@@ -549,7 +549,7 @@ def analyze_image_with_vision(
     """Send an OpenAI-compatible structured request and validate its JSON response."""
 ```
 
-Store cache entries in the plan output directory under `.asset-name-cache.json`; do not include API keys. Record `base_url`, model, and prompt version in plan metadata. If the URL contains `api.ikuncode.cc`, label it `third-party OpenAI-compatible relay`.
+Store cache entries in the plan output directory under `.asset-name-cache.json`; do not include API keys. Record `base_url`, model, and prompt version in plan metadata. If the URL is not an OpenAI URL, label it as an OpenAI-compatible endpoint.
 
 Require `use_vision=True` before loading credentials or importing `openai`. If the current Python lacks `openai`, locate and re-execute under the existing MarkItDown pipx environment using the same strategy as `markitdown-ocr-convert.py`.
 
@@ -849,7 +849,7 @@ Use an environment override and skip cleanly when absent:
 ```python
 SOURCE = Path(os.environ.get(
     "MARKDOWN_ASSET_REAL_FIXTURE",
-    r"F:\化工设计比赛\华南赛区-华南农业大学-凭苯事吃饭\4-动力学来源说明\参考文献\markdown",
+    r"<local-real-fixture-markdown-dir>",
 ))
 
 
@@ -879,7 +879,7 @@ At this point the test should expose any mismatch in counts, syntax handling, or
 Run:
 
 ```powershell
-$env:MARKDOWN_ASSET_REAL_FIXTURE='F:\化工设计比赛\华南赛区-华南农业大学-凭苯事吃饭\4-动力学来源说明\参考文献\markdown'
+$env:MARKDOWN_ASSET_REAL_FIXTURE='<local-real-fixture-markdown-dir>'
 python -m unittest "科研/办公专用skills/luffysolution-skills/convert-documents-to-markdown/tests/test_real_mineru_fixture.py" -v
 ```
 
@@ -902,7 +902,7 @@ Run:
 python -m unittest discover -s "科研/办公专用skills/luffysolution-skills/convert-documents-to-markdown/tests" -v
 ```
 
-Expected: all deterministic and real-fixture tests pass; no file beneath the original `F:\...` path changes.
+Expected: all deterministic and real-fixture tests pass; no file beneath the original local fixture path changes.
 
 - [ ] **Step 5: Commit real-world regression coverage**
 
@@ -964,7 +964,7 @@ State:
 
 - Do not rename unreferenced assets by default.
 - Do not use vision unless requested or deterministic evidence is insufficient and the user approves API use.
-- Treat the configured `api.ikuncode.cc` endpoint as a third-party relay.
+- Treat non-OpenAI provider URLs as OpenAI-compatible endpoints.
 - Operate on a temporary copy for tests.
 
 - [ ] **Step 4: Update command reference and UI metadata**
@@ -986,7 +986,7 @@ Run:
 
 ```powershell
 python -m unittest discover -s "科研/办公专用skills/luffysolution-skills/convert-documents-to-markdown/tests" -v
-python "C:\Users\Administrator\.codex\skills\.system\skill-creator\scripts\quick_validate.py" "科研\办公专用skills\luffysolution-skills\convert-documents-to-markdown"
+python "<skill-creator>/scripts/quick_validate.py" "科研\办公专用skills\luffysolution-skills\convert-documents-to-markdown"
 ```
 
 Expected: all tests pass and validator reports `Skill is valid!`.
@@ -1076,9 +1076,9 @@ Do not create an empty commit when no correction was needed.
 ### Task 12: Install the verified revision into Codex and Claude
 
 **Files:**
-- Source: `C:\Users\Administrator\科研Skills分类合集\科研\办公专用skills\luffysolution-skills\convert-documents-to-markdown`
-- Replace local installation: `C:\Users\Administrator\.codex\skills\convert-documents-to-markdown`
-- Replace local installation: `C:\Users\Administrator\.claude\skills\convert-documents-to-markdown`
+- Source: `<repo>/科研/办公专用skills/luffysolution-skills/convert-documents-to-markdown`
+- Replace local installation: `<codex-home>/skills/convert-documents-to-markdown`
+- Replace local installation: `<claude-home>/skills/convert-documents-to-markdown`
 
 - [ ] **Step 1: Verify source and destination paths**
 
@@ -1103,7 +1103,7 @@ Use native PowerShell `Copy-Item` and `Remove-Item` with verified literal absolu
 For each copy:
 
 ```powershell
-python "C:\Users\Administrator\.codex\skills\.system\skill-creator\scripts\quick_validate.py" "<skill-path>"
+python "<skill-creator>/scripts/quick_validate.py" "<skill-path>"
 python "<skill-path>\scripts\rename-markdown-assets.py" --help
 python "<skill-path>\scripts\rename-markdown-assets.py" check-vision --json
 ```
@@ -1123,7 +1123,7 @@ Report:
 - unit and real-fixture test counts;
 - Codex and Claude installation paths;
 - OCR provider classification without credentials;
-- confirmation that the original `F:\...` fixture was not modified.
+- confirmation that the original local fixture was not modified.
 
 ---
 
@@ -1138,7 +1138,7 @@ Use `superpowers:verification-before-completion`, then rerun:
 
 ```powershell
 python -m unittest discover -s "科研/办公专用skills/luffysolution-skills/convert-documents-to-markdown/tests" -v
-python "C:\Users\Administrator\.codex\skills\.system\skill-creator\scripts\quick_validate.py" "科研\办公专用skills/luffysolution-skills/convert-documents-to-markdown"
+python "<skill-creator>/scripts/quick_validate.py" "科研\办公专用skills/luffysolution-skills/convert-documents-to-markdown"
 git diff --check
 git status --short
 ```

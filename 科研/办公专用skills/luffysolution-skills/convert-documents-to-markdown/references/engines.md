@@ -79,7 +79,7 @@ python scripts/rename-markdown-assets.py check-vision --json
 python scripts/rename-markdown-assets.py plan "/path/to/markdown-root" --output-dir "/path/to/asset-plan" --vision --json
 ```
 
-Vision uses the same OpenAI-compatible environment variables as MarkItDown OCR. Never print or store API keys. For this machine, `https://api.ikuncode.cc/` is a third-party relay, not an official OpenAI endpoint.
+Vision uses the same OpenAI-compatible environment variables as MarkItDown OCR. Never print or store API keys. Treat any non-OpenAI base URL as an OpenAI-compatible endpoint, not an official OpenAI endpoint.
 
 Do not rename unreferenced assets by default. Treat unreferenced assets as review warnings unless the user asks for a separate cleanup pass. For tests or real-fixture regressions, copy the Markdown tree into a temporary directory first and run plan, apply, validate, and rollback only on that copy.
 
@@ -191,7 +191,7 @@ All three values are required. If any are absent:
 1. List only the missing variable names.
 2. Explain that OCR needs an OpenAI-compatible vision API provider.
 3. If a provider URL is already known, direct the user to that provider's dashboard or key-management page.
-4. For this machine, the configured provider is the third-party relay at `https://api.ikuncode.cc/`; do not call it an official OpenAI endpoint.
+4. If the configured provider URL is not an OpenAI URL, describe it as an OpenAI-compatible endpoint rather than an official OpenAI endpoint.
 5. If no provider is known, ask which provider the user wants instead of inventing a signup URL.
 6. After the user supplies credentials, save them securely as user environment variables and run a minimal image OCR test.
 

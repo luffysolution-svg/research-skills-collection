@@ -63,7 +63,7 @@ Use `scripts/rename-markdown-assets.py` when the user asks to organize or rename
 
 - Do not rename unreferenced assets by default.
 - Do not use `--vision` unless the user requests it, or deterministic evidence is insufficient and the user approves API use.
-- Treat `https://api.ikuncode.cc/` as a third-party OpenAI-compatible relay, not an official OpenAI endpoint.
+- Treat any non-OpenAI base URL as an OpenAI-compatible endpoint, not an official OpenAI endpoint.
 - Operate on a temporary copy for tests and regressions; never mutate user fixture directories such as shared MinerU output when validating behavior.
 
 ## Routing constraints
